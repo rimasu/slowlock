@@ -10,7 +10,7 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
     println!("# Round trip with work function target_duration={:?}", target_duration);
 
     println!("Calibrating work function (this may take a few seconds):");
-    let work = Argon2WorkFunction::calibrate(target_duration)?;
+    let work = Argon2WorkFunction::calibrate(target_duration, true)?;
     println!("Calibration complete mem_cost={}, time_cost={}, lanes={}", work.mem_cost, work.time_cost, work.lanes);
 
     println!();
@@ -46,6 +46,12 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
 
 
 fn main() {
+
+    #[cfg(feature="logging")] {
+        simple_logger::SimpleLogger::new().init().unwrap();
+    }
+
+    encryption_round_trip_demo(Duration::from_millis(100)).unwrap();
     encryption_round_trip_demo(Duration::from_millis(500)).unwrap();
     encryption_round_trip_demo(Duration::from_millis(2500)).unwrap();
 }

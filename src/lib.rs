@@ -39,6 +39,9 @@ use rand::RngCore;
 use sha2::Digest;
 use sysinfo::SystemExt;
 
+#[cfg(feature="logging")]
+use log::info;
+
 /// Library error types
 #[derive(Debug)]
 pub enum Error {
@@ -82,7 +85,12 @@ pub trait WorkFunction: Sized {
     /// Attempt to create work function that will take approximately
     /// the `target_duration`.
     ///
-    fn calibrate(target_duration: Duration) -> Result<Self, Error>;
+    /// # Arguments
+    /// * `target_duration` - how long the work function should take
+    /// * `verbose` - if compiled with `log` support and `verbose` is true the algorithm should
+    /// log its attempts to tune the duration.
+    ///
+    fn calibrate(target_duration: Duration, verbose: bool) -> Result<Self, Error>;
 }
 
 /// Key function based on Argon2.
@@ -119,7 +127,18 @@ impl WorkFunction for Argon2WorkFunction {
     }
 
 
-    fn calibrate(target_duration: Duration) -> Result<Argon2WorkFunction, Error> {
+    fn calibrate(target_duration: Duration, verbose: bool) -> Result<Argon2WorkFunction, Error> {
+        Self::calibrate(target_duration, verbose, DEFAULT_MEM_PERCENT)
+    }
+}
+
+impl Argon2WorkFunction {
+
+    fn calibrate(
+        target_duration: Duration,
+        verbose: bool,
+        memory_percent: u64,
+    ) -> Result<Argon2WorkFunction, Error> {
         let mut system = sysinfo::System::new_all();
         system.refresh_all();
 
@@ -127,10 +146,16 @@ impl WorkFunction for Argon2WorkFunction {
         let num_cpus = system.get_processors().len() as u32;
 
         let lanes = num_cpus * 2;
-        let mem_cost = (total_mem * DEFAULT_MEM_PERCENT / 100) as u32;
+        let mem_cost = (total_mem * memory_percent / 100) as u32;
         let time_cost = 1;
         let mut salt = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut salt);
+
+        #[cfg(feature="logging")]
+        if verbose {
+            info!("Initialized mem to {}kb ({}% of total memory, {}km).", mem_cost, memory_percent, total_mem);
+            info!("Initialized lanes to {} (2x num cpus).", lanes);
+        }
 
         let mut work = Argon2WorkFunction {
             mem_cost,
@@ -143,8 +168,16 @@ impl WorkFunction for Argon2WorkFunction {
 
         // increase time cost until we are above the target.
         while duration < target_duration {
-            let scale = (target_duration.as_micros() as f64 / duration.as_micros() as f64);
-            work.time_cost = (work.time_cost as f64 * scale).ceil() as u32;
+            let scale = target_duration.as_micros() as f64 / duration.as_micros() as f64;
+            let next_time_cost = (work.time_cost as f64 * scale).ceil() as u32;
+
+            #[cfg(feature="logging")]
+            if verbose {
+                info!("Estimated duration {}ms is too low, increasing time_cost from {} to {}.",
+                      duration.as_millis(), work.time_cost, next_time_cost);
+            }
+
+            work.time_cost = next_time_cost;
             duration = work.estimate_duration()?;
         }
 
@@ -154,17 +187,36 @@ impl WorkFunction for Argon2WorkFunction {
         let lo = target_duration - tolerance;
         let hi = target_duration + tolerance;
 
+
         while duration < lo || duration > hi {
-            let scale = (target_duration.as_micros() as f64 / duration.as_micros() as f64);
-            work.mem_cost = (work.mem_cost as f64 * scale) as u32;
+            let scale = target_duration.as_micros() as f64 / duration.as_micros() as f64;
+            let next_mem_cost = (work.mem_cost as f64 * scale) as u32;
+
+            #[cfg(feature="logging")]
+            if verbose {
+                if duration < lo {
+                    info!("Estimated duration {}ms is too low, increasing mem_cost from {}kb to {}kb.",
+                          duration.as_millis(), work.mem_cost, next_mem_cost)
+                } else {
+                    info!("Estimated duration {}ms is too high, decreasing mem_cost from {}kb to {}kb.",
+                          duration.as_millis(), work.mem_cost, next_mem_cost)
+                }
+            }
+
+            work.mem_cost = next_mem_cost;
             duration = work.estimate_duration()?;
+        }
+
+        #[cfg(feature="logging")]
+        if verbose {
+            info!("Calibration complete, estimated duration={}ms, mem_cost={}kb, time_cost={}, lanes={}.",
+                  duration.as_millis(), work.mem_cost, work.time_cost, work.lanes);
         }
 
         Ok(work)
     }
-}
 
-impl Argon2WorkFunction {
+
     fn estimate_duration(&self) -> Result<Duration, Error> {
         let now = Instant::now();
         let _key: GenericArray<u8, U32> = self.make_key(&[0u8; 32])?;
