@@ -3,6 +3,12 @@ name = "slowlock"
 version = "0.1.0"
 authors = ["Richard Sunderland <798934+rimasu@users.noreply.github.com>"]
 edition = "2018"
+license = "MIT/Apache-2.0"
+description = "SlowLock convenience wrapper for processing cipher password with a proof of work function"
+keywords = ["aead", "argon2", "proof", "work"]
+documentation = "https://docs.rs/slowlock/"
+homepage = "https://github.com/rimasu/slowlock"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
