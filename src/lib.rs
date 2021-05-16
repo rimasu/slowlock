@@ -54,7 +54,7 @@ use aead::generic_array::{ArrayLength, GenericArray};
 use aead::generic_array::typenum::consts::U32;
 use aead::NewAead;
 #[cfg(feature = "logging")]
-use log::info;
+use log::{info, warn};
 use sysinfo::{System, SystemExt};
 
 /// Library error types
@@ -94,6 +94,10 @@ pub trait NewSlowAead<A> {
     /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
     /// `password` end up with different `cipher_key`s.
     ///
+    /// # Errors
+    ///
+    /// Will return an error if proof of work functions parameters are not valid.
+    ///
     fn slow_new(&self, password: &[u8], salt: &[u8]) -> Result<A, Error>;
 }
 
@@ -104,6 +108,7 @@ impl<W, A> NewSlowAead<A> for W
         A: NewAead,
 {
     fn slow_new(&self, password: &[u8], salt: &[u8]) -> Result<A, Error> {
+
         let now = Instant::now();
         let key = self.make_cipher_key(password, salt)?;
         let work_duration = now.elapsed();
@@ -167,11 +172,11 @@ pub trait WorkFunction: Sized {
 /// let password = "super secret password".as_bytes();
 ///
 /// // Salt should be generated using a cryptographically secure pseudo random number generator
-/// let salt = hex!("8a248444f2fc510308a856b35de67b312a4c4be1d180f49e101bf6330af5d472");
+/// let salt = hex!("8a248444f2fc50308a856b35de67b312a4c4be1d180f49e101bf6330af5d47");
 ///
 /// let key: GenericArray<u8, U32> = work_fn.make_cipher_key(password, &salt)?;
 ///
-/// let expected_key = &hex!("61c15670afec9db94cb21a8ff5a4859475d72657fdc6d31f6bb9d34464a3a22e");
+/// let expected_key = &hex!("a2867fb2a2ddb384cba4f382f5db48b36066cbcb755ed7f07aeabef1f98fbf54");
 /// assert_eq!(expected_key, key.as_slice());
 ///
 /// # Ok(()) }
@@ -266,7 +271,7 @@ impl Argon2WorkFunctionCalibrator {
     ///
     /// // Try to create a lock that uses approximately 7.3% of total memory and takes
     /// // about 2.5s to process
-    /// let lock = Argon2WorkFunctionCalibrator::new()
+    /// let lock = Argon2WorkFunctionCalibrator::default()
     ///                 .memory_hint_percent(7.3)
     ///                 .calibrate(Duration::from_millis(2500))?;
     ///
@@ -475,17 +480,29 @@ impl Argon2WorkFunctionCalibrator {
             let scale = target_duration.as_micros() as f64 / duration.as_micros() as f64;
             let next_mem_cost = (work.mem_cost as f64 * scale) as u32;
 
-            #[cfg(feature = "logging")]
-            if self.verbose {
-                if duration < lo {
+
+            if duration < lo {
+                #[cfg(feature = "logging")]
+                if self.verbose {
                     info!("Estimated duration {}ms is too low, increasing mem_cost from {}kb to {}kb.",
                           duration.as_millis(), work.mem_cost, next_mem_cost)
-                } else {
+                }
+            } else {
+                #[cfg(feature = "logging")]
+                if self.verbose {
                     info!("Estimated duration {}ms is too high, decreasing mem_cost from {}kb to {}kb.",
-                          duration.as_millis(), work.mem_cost, next_mem_cost)
+                          duration.as_millis(), work.mem_cost, next_mem_cost);
+                }
+
+                if next_mem_cost < work.lanes * 8 {
+                    #[cfg(feature = "logging")]
+                    if self.verbose {
+                        warn!("Although too high, using mem_cost as next adjustment will take it below lowest limit.\
+                         This likely means that you have far too little memory allocated to Argon2")
+                    }
+                    break
                 }
             }
-
             work.mem_cost = next_mem_cost;
             duration = work.estimate_duration()?;
         }
@@ -504,11 +521,13 @@ impl Argon2WorkFunction {
 
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use aead::Aead;
     use aead::generic_array::GenericArray;
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
 
-    use crate::{Argon2WorkFunction, NewSlowAead};
+    use crate::{Argon2WorkFunction, Argon2WorkFunctionCalibrator, Error, NewSlowAead};
 
     const DATA: &[u8] = b"Secret data";
     const PASSWORD1: &[u8] = b"password1";
@@ -577,7 +596,7 @@ mod test {
                              SALT1,
                              SALT1).err().unwrap();
 
-        assert_eq!(aead::Error, err);
+        assert_eq!(Error::AeadOperationFailed, err);
     }
 
     #[test]
@@ -590,7 +609,7 @@ mod test {
                              SALT1,
                              SALT2).err().unwrap();
 
-        assert_eq!(aead::Error, err);
+        assert_eq!(Error::AeadOperationFailed, err);
     }
 
     #[test]
@@ -605,7 +624,7 @@ mod test {
                              SALT1,
                              SALT1).err().unwrap();
 
-        assert_eq!(aead::Error, err);
+        assert_eq!(Error::AeadOperationFailed, err);
     }
 
     #[test]
@@ -620,7 +639,7 @@ mod test {
                              SALT1,
                              SALT1).err().unwrap();
 
-        assert_eq!(aead::Error, err);
+        assert_eq!(Error::AeadOperationFailed, err);
     }
 
     #[test]
@@ -635,9 +654,48 @@ mod test {
                              SALT1,
                              SALT1).err().unwrap();
 
-        assert_eq!(aead::Error, err);
+        assert_eq!(Error::AeadOperationFailed, err);
     }
 
+    #[test]
+    fn algo_gen_fails_if_mem_cost_too_low() {
+        let mut work_fn2 = test_work_function();
+        work_fn2.mem_cost = 0;
+        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1);
+        let err = result.err().unwrap();
+
+        assert_eq!(Error::ProofOfWorkFailed("MemoryTooLittle".to_string()), err);
+    }
+
+    #[test]
+    fn algo_gen_fails_if_time_cost_too_low() {
+        let mut work_fn2 = test_work_function();
+        work_fn2.time_cost = 0;
+        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1);
+        let err = result.err().unwrap();
+
+        assert_eq!(Error::ProofOfWorkFailed("TimeTooSmall".to_string()), err);
+    }
+
+    #[test]
+    fn algo_gen_fails_if_lanes_too_low() {
+        let mut work_fn2 = test_work_function();
+        work_fn2.lanes = 0;
+        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1);
+        let err = result.err().unwrap();
+
+        assert_eq!(Error::ProofOfWorkFailed("LanesTooFew".to_string()), err);
+    }
+
+    #[test]
+    fn algo_gen_fails_if_salt_too_short() {
+        let work_fn2 = test_work_function();
+        let short_salt = &[0u8; 7];
+        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, short_salt);
+        let err = result.err().unwrap();
+
+        assert_eq!(Error::ProofOfWorkFailed("SaltTooShort".to_string()), err);
+    }
 
     fn round_trip(
         data: &[u8],
@@ -647,14 +705,81 @@ mod test {
         password2: &[u8],
         salt1: &[u8],
         salt2: &[u8],
-    ) -> Result<Vec<u8>, aead::Error> {
-        let algo1: Aes256Gcm = work_fn1.slow_new(&password1, salt1).unwrap();
-        let algo2: Aes256Gcm = work_fn2.slow_new(&password2, salt2).unwrap();
+    ) -> Result<Vec<u8>, Error> {
+        let algo1: Aes256Gcm = work_fn1.slow_new(&password1, salt1)?;
+        let algo2: Aes256Gcm = work_fn2.slow_new(&password2, salt2)?;
 
         let encrypted = algo1
             .encrypt(GenericArray::from_slice(&[0u8; 12]), &data[..])
             .unwrap();
 
         algo2.decrypt(GenericArray::from_slice(&[0u8; 12]), encrypted.as_slice())
+            .map_err(|e| e.into())
+    }
+
+
+    #[test]
+    fn can_calibrate_with_fixed_num_lanes() {
+        let work = Argon2WorkFunctionCalibrator::default()
+            .lanes(1)
+            .calibrate(Duration::from_millis(100))
+            .unwrap();
+
+        assert_eq!(1, work.lanes);
+    }
+
+    #[test]
+    fn can_calibrate_with_memory_hint_kb() {
+        let work1 = Argon2WorkFunctionCalibrator::default()
+            .lanes(1)
+            .memory_hint_kb(8)
+            .calibrate(Duration::from_millis(2000))
+            .unwrap();
+
+        let work2 = Argon2WorkFunctionCalibrator::default()
+            .lanes(1)
+            .memory_hint_kb(1024)
+            .calibrate(Duration::from_millis(2000))
+            .unwrap();
+
+        // we can't be sure what the final work.mem_cost will be because
+        // the calibration function will tune it differently. However work2 should normally
+        // have a higher mem_cost than work1.
+        assert!(work2.mem_cost > work1.mem_cost)
+    }
+
+    #[test]
+    fn can_calibrate_with_memory_hint_percent() {
+        let work1 = Argon2WorkFunctionCalibrator::default()
+            .memory_hint_percent(0.1)
+            .calibrate(Duration::from_millis(500))
+            .unwrap();
+
+        let work2 = Argon2WorkFunctionCalibrator::default()
+            .memory_hint_percent(6.0)
+            .calibrate(Duration::from_millis(500))
+            .unwrap();
+
+        // we can't be sure what the final work.mem_cost will be because
+        // the calibration function will tune it differently. However work2 should normally
+        // have a higher mem_cost than work1.
+        assert!(work2.mem_cost > work1.mem_cost)
+    }
+
+
+    #[test]
+    fn can_calibrate_with_verbose_true() {
+        let calibrator = Argon2WorkFunctionCalibrator::default()
+            .verbose(true);
+
+        assert_eq!(true, calibrator.verbose);
+    }
+
+    #[test]
+    fn can_calibrate_with_verbose_false() {
+        let calibrator = Argon2WorkFunctionCalibrator::default()
+            .verbose(false);
+
+        assert_eq!(false, calibrator.verbose);
     }
 }
