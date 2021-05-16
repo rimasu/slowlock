@@ -1,12 +1,34 @@
 //! # Slow Lock
 //!
-//! Slow lock is an adapter that combines an AEAD cipher and a proof of work
-//! function to create an encryption primitive that has tuneable resistance to
-//! brute force attacks.
+//! Slow is a thin convenience layer that makes it easy to use a proof of work function
+//! to recover a cipher key.
+//!
+//! It implements no new cryptographic primitives, instead in provides some mechanisms to
+//!
+//! 1) Help calibrate the proof of work function to take a reasonable amount of time
+//! 2) Detect when a previously configured proof of work function is no-long adequate
 //!
 //! Currently the only implementation of the proof of work function is based
 //! on Argon2.
 //!
+//!
+//! Basic process:
+//!
+//! 1. `password` is passed through proof of work function to create `cipher_key`.
+//! 3. `cipher_key` and `nonce` are used to decrypt/encrypt content.
+//!
+//! To be useful the proof of work function must take a reasonable amount of time/effort
+//! to complete. This crates provides a [Argon2WorkFunctionCalibrator] with (I hope) reasonable
+//! defaults that can be used to create work functions with variable target durations.
+//!
+//! The other part of this is detecting when a previously reasonable work function is now
+//! completing too quickly. Unless occasionally re-calibrated, we should expect this to happen
+//! over time as machine performance improves.
+//!
+//! This crate has X ways to to detect work functions that are too weak.
+//!
+//! 1) If logging is enabled and the work function completes in less than two thirds the expected
+//! time a warning is logged.
 //!
 //! ## Design Choices (for review)
 //!
@@ -18,27 +40,21 @@
 //!
 //! Argon2 supports use of a secret.  This can be used a 'pepper'. Unlike a salt, a pepper is
 //! not stored along side the hash and can be reused across multiple passwords. Typically it
-//! is long and may stored be in some trusted hardware store.  This secret means that an attacker
+//! is long and may be stored be in some trusted hardware store.  This secret means that an attacker
 //! in possession of the hashed password and salt still has a missing component.
 //!
 //! In this library Argon2 is not being used to verify password, but as a proof of work
 //! function. So although the salt is stored, the hashed password is never exposed (it is
-//! directly used as associated data). This means there is no risk of the attacker gaining access
-//! to the salt and hashed password.
+//! directly used as the `cipher_key`). This means there is limited risk of the attacker gaining access
+//! to the `salt` and hashed password.
 //!
-//! ### Key is based on password and nonce
-//!
-//!
-use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
-use aead::generic_array::typenum::consts::U32;
 use aead::generic_array::{ArrayLength, GenericArray};
-use aead::{AeadInPlace, NewAead, Nonce, Tag};
+use aead::generic_array::typenum::consts::U32;
+use aead::NewAead;
 #[cfg(feature = "logging")]
 use log::info;
-use rand::RngCore;
-use sha2::Digest;
 use sysinfo::{System, SystemExt};
 
 /// Library error types
@@ -71,29 +87,105 @@ impl From<aead::Error> for Error {
     }
 }
 
-/// Key function can turn content into a key of the correct size.
+pub trait NewSlowAead<A> {
+    /// Create a new AEAD instance by passing the password through a proof of work function.
+    /// # Arguments
+    /// * `password` - secret data supplied by user
+    /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
+    /// `password` end up with different `cipher_key`s.
+    ///
+    fn slow_new(&self, password: &[u8], salt: &[u8]) -> Result<A, Error>;
+}
+
+/// NewSlowAead is implemented for anything that implements a work function.
+impl<W, A> NewSlowAead<A> for W
+    where
+        W: WorkFunction,
+        A: NewAead,
+{
+    fn slow_new(&self, password: &[u8], salt: &[u8]) -> Result<A, Error> {
+        let now = Instant::now();
+        let key = self.make_cipher_key(password, salt)?;
+        let work_duration = now.elapsed();
+
+        Ok(A::new(&key))
+    }
+}
+
+/// Work function can turn content into a key of the correct size.
 ///
 /// Implementations of this interface are responsible for making sure
 /// the conversion process takes an appropriate amount of computational effort.
 ///
 pub trait WorkFunction: Sized {
-    fn make_key<K>(&self, content: &[u8]) -> Result<GenericArray<u8, K>, Error>
-    where
-        K: ArrayLength<u8>;
+    /// Generate a `cipher_key` from a `password` and a `salt`.
+    ///
+    /// # Arguments
+    /// * `password` - secret data supplied by user
+    /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
+    /// `password` end up with different `cipher_key`s.
+    ///
+    fn make_cipher_key<K>(&self, password: &[u8], salt: &[u8]) -> Result<GenericArray<u8, K>, Error>
+        where
+            K: ArrayLength<u8>;
 }
 
-/// Key function based on Argon2.
+/// Work function based on Argon2.
+///
+/// | Parameter       | Value                                                                    |
+/// | --------------- | ------------------------------------------------------------------------ |
+/// | Algorithm       | `Argon2`                                                                 |
+/// | Reference       | [draft irtf](https://datatracker.ietf.org/doc/draft-irtf-cfrg-argon2/)   |
+/// | Salt            | Supplied by user                                                         |
+/// | Parallelism     | Automatically calibrated to twice number of cpus                         |
+/// | Tag Length      | Automatically set to match KeySize of AEAD                               |
+/// | Memory Size     | Automatically calibrated (defaults to approxmately 5% of total memory)   |
+/// | Iterations      | Automatically calibrated                                                 |
+/// | Version         | 0x13 (i.e. version 1.3 of Argon2)                                        |
+/// | Variant         | Argon2id  (hybrid resistant to side-channel and gpu attacks)             |
+/// | Key             | Not used                                                                 |
+/// | Associated Data | Not used                                                                 |
+///
+/// ```
+/// # use slowlock::Error;
+/// # fn main() -> Result<(), Error> {
+/// use std::time::Duration;
+/// use aead::generic_array::{GenericArray, typenum::U32};
+/// use hex_literal::hex;
+/// use slowlock::{Argon2WorkFunction, WorkFunction};
+///
+/// // Normally you should use the `Argon2WorkFunctionCalibrator`, but to make sure we
+/// // get exactly the same configuration we are going to fix the parameters.
+/// let work_fn = Argon2WorkFunction {
+///     mem_cost: 4096,
+///     time_cost: 12,
+///     lanes: 10
+/// };
+///
+/// // User supplied secret. This could be a password or a key recovered
+/// // from an earlier stage in the decryption/encryption process.
+/// let password = "super secret password".as_bytes();
+///
+/// // Salt should be generated using a cryptographically secure pseudo random number generator
+/// let salt = hex!("8a248444f2fc510308a856b35de67b312a4c4be1d180f49e101bf6330af5d472");
+///
+/// let key: GenericArray<u8, U32> = work_fn.make_cipher_key(password, &salt)?;
+///
+/// let expected_key = &hex!("61c15670afec9db94cb21a8ff5a4859475d72657fdc6d31f6bb9d34464a3a22e");
+/// assert_eq!(expected_key, key.as_slice());
+///
+/// # Ok(()) }
+/// ```
 pub struct Argon2WorkFunction {
     pub mem_cost: u32,
     pub time_cost: u32,
     pub lanes: u32,
-    pub salt: [u8; 32],
 }
 
 impl WorkFunction for Argon2WorkFunction {
-    fn make_key<K>(&self, content: &[u8]) -> Result<GenericArray<u8, K>, Error>
-    where
-        K: ArrayLength<u8>,
+    fn make_cipher_key<K>(&self, password: &[u8], salt: &[u8]) -> Result<GenericArray<u8, K>, Error>
+        where
+            K: ArrayLength<u8>,
     {
         let config = argon2::Config {
             ad: &[],
@@ -107,9 +199,9 @@ impl WorkFunction for Argon2WorkFunction {
             version: argon2::Version::Version13,
         };
 
-        Ok(GenericArray::clone_from_slice(&argon2::hash_raw(
-            content, &self.salt, &config,
-        )?))
+        argon2::hash_raw(password, salt, &config)
+            .map_err(|e| e.into())
+            .map(|h| GenericArray::clone_from_slice(&h))
     }
 }
 
@@ -121,7 +213,7 @@ impl WorkFunction for Argon2WorkFunction {
 /// use slowlock::Argon2WorkFunctionCalibrator;
 /// use std::time::Duration;
 ///
-/// // Try to create a lock that uses a takes about 2.5s to process.
+/// // Try to create a lock that uses a takes about 2s to process.
 /// let lock = Argon2WorkFunctionCalibrator::new()
 ///                 .calibrate(Duration::from_millis(2500))?;
 ///
@@ -216,7 +308,7 @@ impl Argon2WorkFunctionCalibrator {
         self
     }
 
-    /// Set how much lanes the work function will use.
+    /// Set how many processing lanes the work function will use.
     ///
     /// By default the work function will use two lanes for each CPU.
     ///
@@ -297,14 +389,10 @@ impl Argon2WorkFunctionCalibrator {
 
         let lanes = self.lanes.unwrap_or_else(|| self.pick_num_lanes(&system));
 
-        let mut salt = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-
         Argon2WorkFunction {
             mem_cost,
             time_cost: 1,
             lanes,
-            salt,
         }
     }
 
@@ -409,150 +497,51 @@ impl Argon2WorkFunctionCalibrator {
 impl Argon2WorkFunction {
     fn estimate_duration(&self) -> Result<Duration, Error> {
         let now = Instant::now();
-        let _key: GenericArray<u8, U32> = self.make_key(&[0u8; 32])?;
+        let _key: GenericArray<u8, U32> = self.make_cipher_key(&[0u8; 32], &[0u8; 32])?;
         Ok(now.elapsed())
-    }
-}
-
-pub struct SlowLock<P, A, W> {
-    password: P,
-    work_function: W,
-    _phantom: PhantomData<A>,
-}
-
-impl<P, A, W> SlowLock<P, A, W>
-where
-    P: AsRef<[u8]>,
-    A: AeadInPlace + NewAead,
-    W: WorkFunction,
-{
-    pub fn new(password: P, key_function: W) -> SlowLock<P, A, W> {
-        SlowLock {
-            password,
-            work_function: key_function,
-            _phantom: PhantomData {},
-        }
-    }
-
-    fn encrypt_in_place_detached(
-        &self,
-        nonce: &Nonce<Self>,
-        associated_data: &[u8],
-        buffer: &mut [u8],
-    ) -> Result<Tag<Self>, Error> {
-        self.make_cipher(nonce).and_then(|(algo, _duration)| {
-            algo.encrypt_in_place_detached(nonce, &associated_data, buffer)
-                .map_err(|_| Error::AeadOperationFailed)
-        })
-    }
-
-    fn decrypt_in_place_detached(
-        &self,
-        nonce: &Nonce<Self>,
-        associated_data: &[u8],
-        buffer: &mut [u8],
-        tag: &Tag<Self>,
-    ) -> Result<(), Error> {
-        self.make_cipher(nonce).and_then(|(algo, _duration)| {
-            algo.decrypt_in_place_detached(nonce, &associated_data, buffer, tag)
-                .map_err(|_| Error::AeadOperationFailed)
-        })
-    }
-
-    fn make_cipher(&self, nonce: &Nonce<Self>) -> Result<(A, Duration), Error> {
-        // make unique key_content by combining key_hash + nonce data using SHA-256
-        let mut digest = sha2::Sha256::new();
-        digest.update(self.password.as_ref());
-        digest.update(nonce.as_slice());
-        let key_content = digest.finalize();
-
-        let now = Instant::now();
-        let cipher_key = self.work_function.make_key(&key_content)?;
-        let work_duration = now.elapsed();
-
-        Ok((A::new(&cipher_key), work_duration))
-    }
-}
-
-impl<P, A, W> aead::AeadCore for SlowLock<P, A, W>
-where
-    A: AeadInPlace + NewAead,
-{
-    type NonceSize = A::NonceSize;
-    type TagSize = A::TagSize;
-    type CiphertextOverhead = A::CiphertextOverhead;
-}
-
-impl<P, A, W> AeadInPlace for SlowLock<P, A, W>
-where
-    P: AsRef<[u8]>,
-    A: AeadInPlace + NewAead,
-    W: WorkFunction,
-{
-    fn encrypt_in_place_detached(
-        &self,
-        nonce: &Nonce<Self>,
-        associated_data: &[u8],
-        buffer: &mut [u8],
-    ) -> Result<Tag<Self>, aead::Error> {
-        self.encrypt_in_place_detached(nonce, associated_data, buffer)
-            .map_err(|_| aead::Error)
-    }
-
-    fn decrypt_in_place_detached(
-        &self,
-        nonce: &Nonce<Self>,
-        associated_data: &[u8],
-        buffer: &mut [u8],
-        tag: &Tag<Self>,
-    ) -> Result<(), aead::Error> {
-        self.decrypt_in_place_detached(nonce, associated_data, buffer, tag)
-            .map_err(|_| aead::Error)
     }
 }
 
 #[cfg(test)]
 mod test {
+    use aead::Aead;
     use aead::generic_array::GenericArray;
-    use aead::{Aead, AeadInPlace, NewAead};
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
 
-    use crate::{Argon2WorkFunction, SlowLock, WorkFunction};
+    use crate::{Argon2WorkFunction, NewSlowAead};
+
+    const DATA: &[u8] = b"Secret data";
+    const PASSWORD1: &[u8] = b"password1";
+    const PASSWORD2: &[u8] = b"password2";
+    const SALT1: &[u8] = &[0u8; 32];
+    const SALT2: &[u8] = &[1u8; 32];
 
     fn test_work_function() -> Argon2WorkFunction {
         Argon2WorkFunction {
             mem_cost: 4096,
             time_cost: 2,
             lanes: 3,
-            salt: [0u8; 32],
         }
     }
 
     #[test]
-    fn can_use_aes_gcm256_with_argon2_work_function() {
-        let work_fn = test_work_function();
-        let algo: SlowLock<_, Aes256Gcm, _> = SlowLock::new("thing", work_fn);
-
-        round_trip(&algo, [0u8; 12]);
+    fn round_trip_aes_gcm128() {
+        let algo: Aes128Gcm = test_work_function().slow_new(b"password1", &[0u8; 32]).unwrap();
+        round_trip_aead(algo);
     }
 
     #[test]
-    fn can_use_aes_gcm128_with_argon2_work_function() {
-        let work_fn = test_work_function();
-        let algo: SlowLock<_, Aes128Gcm, _> = SlowLock::new("thing", work_fn);
-
-        round_trip(&algo, [0u8; 12]);
+    fn round_trip_aes_gcm256() {
+        let algo: Aes256Gcm = test_work_function().slow_new(b"password1", &[0u8; 32]).unwrap();
+        round_trip_aead(algo);
     }
 
-    fn round_trip<P, A, K, D>(algo: &SlowLock<P, A, K>, nonce: D)
-    where
-        D: AsRef<[u8]>,
-        P: AsRef<[u8]>,
-        A: AeadInPlace + NewAead,
-        K: WorkFunction,
+    fn round_trip_aead<A>(algo: A)
+        where
+            A: Aead,
     {
         let data = "message text".as_bytes();
-        let nonce = nonce.as_ref();
+        let nonce = &[0u8; 12];
 
         let encrypted = algo
             .encrypt(GenericArray::from_slice(nonce), &data[..])
@@ -566,43 +555,106 @@ mod test {
     }
 
     #[test]
+    fn decrypt_succeeds_if_work_fns_same() {
+        let out = round_trip(DATA,
+                             test_work_function(),
+                             test_work_function(),
+                             PASSWORD1,
+                             PASSWORD1,
+                             SALT1,
+                             SALT1).unwrap();
+
+        assert_eq!(DATA, out.as_slice());
+    }
+
+    #[test]
     fn decrypt_fails_if_password_is_wrong() {
-        let data = "message text".as_bytes();
-
-        let work_fn1 = test_work_function();
-        let work_fn2 = test_work_function();
-
-        let algo1: SlowLock<_, Aes256Gcm, _> = SlowLock::new("thing1", work_fn1);
-        let algo2: SlowLock<_, Aes256Gcm, _> = SlowLock::new("thing2", work_fn2);
-
-        let encrypted = algo1
-            .encrypt(GenericArray::from_slice(&[0u8; 12]), &data[..])
-            .unwrap();
-
-        let err = algo2
-            .decrypt(GenericArray::from_slice(&[0u8; 12]), encrypted.as_slice())
-            .err()
-            .unwrap();
+        let err = round_trip(DATA,
+                             test_work_function(),
+                             test_work_function(),
+                             PASSWORD1,
+                             PASSWORD2,
+                             SALT1,
+                             SALT1).err().unwrap();
 
         assert_eq!(aead::Error, err);
     }
 
     #[test]
-    fn decrypt_fails_if_nonce_is_wrong() {
-        let data = "message text".as_bytes();
+    fn decrypt_fails_if_salt_is_wrong() {
+        let err = round_trip(DATA,
+                             test_work_function(),
+                             test_work_function(),
+                             PASSWORD1,
+                             PASSWORD1,
+                             SALT1,
+                             SALT2).err().unwrap();
 
-        let work_fn = test_work_function();
-        let algo: SlowLock<_, Aes256Gcm, _> = SlowLock::new("thing1", work_fn);
+        assert_eq!(aead::Error, err);
+    }
 
-        let encrypted = algo
+    #[test]
+    fn decrypt_fails_if_mem_cost_is_wrong() {
+        let mut work_fn2 = test_work_function();
+        work_fn2.mem_cost += 1;
+        let err = round_trip(DATA,
+                             test_work_function(),
+                             work_fn2,
+                             PASSWORD1,
+                             PASSWORD1,
+                             SALT1,
+                             SALT1).err().unwrap();
+
+        assert_eq!(aead::Error, err);
+    }
+
+    #[test]
+    fn decrypt_fails_if_time_cost_is_wrong() {
+        let mut work_fn2 = test_work_function();
+        work_fn2.time_cost += 1;
+        let err = round_trip(DATA,
+                             test_work_function(),
+                             work_fn2,
+                             PASSWORD1,
+                             PASSWORD1,
+                             SALT1,
+                             SALT1).err().unwrap();
+
+        assert_eq!(aead::Error, err);
+    }
+
+    #[test]
+    fn decrypt_fails_if_lanes_is_wrong() {
+        let mut work_fn2 = test_work_function();
+        work_fn2.lanes += 1;
+        let err = round_trip(DATA,
+                             test_work_function(),
+                             work_fn2,
+                             PASSWORD1,
+                             PASSWORD1,
+                             SALT1,
+                             SALT1).err().unwrap();
+
+        assert_eq!(aead::Error, err);
+    }
+
+
+    fn round_trip(
+        data: &[u8],
+        work_fn1: Argon2WorkFunction,
+        work_fn2: Argon2WorkFunction,
+        password1: &[u8],
+        password2: &[u8],
+        salt1: &[u8],
+        salt2: &[u8],
+    ) -> Result<Vec<u8>, aead::Error> {
+        let algo1: Aes256Gcm = work_fn1.slow_new(&password1, salt1).unwrap();
+        let algo2: Aes256Gcm = work_fn2.slow_new(&password2, salt2).unwrap();
+
+        let encrypted = algo1
             .encrypt(GenericArray::from_slice(&[0u8; 12]), &data[..])
             .unwrap();
 
-        let err = algo
-            .decrypt(GenericArray::from_slice(&[1u8; 12]), encrypted.as_slice())
-            .err()
-            .unwrap();
-
-        assert_eq!(aead::Error, err);
+        algo2.decrypt(GenericArray::from_slice(&[0u8; 12]), encrypted.as_slice())
     }
 }

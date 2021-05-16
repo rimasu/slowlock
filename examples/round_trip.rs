@@ -1,8 +1,12 @@
-use aead::generic_array::GenericArray;
-use aead::Aead;
-use aes_gcm::Aes256Gcm;
-use slowlock::{Argon2WorkFunction, Argon2WorkFunctionCalibrator, Error, SlowLock, WorkFunction};
 use std::time::{Duration, Instant};
+
+use aead::generic_array::GenericArray;
+use aes_gcm::Aes256Gcm;
+
+use aead::Aead;
+use slowlock::{
+    Argon2WorkFunctionCalibrator, Error, NewSlowAead,
+};
 
 fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
     println!(
@@ -25,14 +29,14 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
 
     // Really this needs to be a unique nonce
     let nonce = GenericArray::clone_from_slice(&[0u8; 12]);
-
-    let algo: SlowLock<_, Aes256Gcm, _> = SlowLock::new(password, work);
+    let salt = &[0u8; 32];
 
     println!(
         "Encrypting message, this should take about {:?} ",
         target_duration
     );
     let encrypt_timer = Instant::now();
+    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt)?;
     let encrypted_message = algo.encrypt(&nonce, message)?;
     println!(
         "Encryption complete (actual time={:?})",
@@ -46,6 +50,7 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
         target_duration
     );
     let decrypt_timer = Instant::now();
+    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt)?;
     let decrypted_message = algo.decrypt(&nonce, encrypted_message.as_slice())?;
     println!(
         "Decryption complete (actual time={:?})",

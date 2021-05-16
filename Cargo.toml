@@ -10,8 +10,6 @@ edition = "2018"
 aead = "0.4.1"
 rust-argon2 = "0.8.3"
 sysinfo = "0.17.3"
-sha2 = "0.9.4"
-rand = "0.8.3"
 log = { version = "0.4.14", optional = true }
 
 [features]
@@ -20,3 +18,4 @@ logging = ["log"]
 [dev-dependencies]
 aes-gcm = "0.9.1"
 simple_logger = "1.11.0"
+hex-literal = "0.3.1"
