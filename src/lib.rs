@@ -60,7 +60,9 @@ use sysinfo::{System, SystemExt};
 /// Library error types
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
-    // Encrypt/decrypt operation failed. Probably due to bad key
+    /// Encrypt/decrypt operation failed.
+    /// This can be useful when working with code that is both using Aead functions
+    /// and functions from this crate.
     AeadOperationFailed,
 
     /// The proof of work function failed to generate a valid proof of work.
@@ -75,11 +77,6 @@ pub enum Error {
     ProofOfWorkCompletedTooQuickly,
 }
 
-impl From<argon2::Error> for Error {
-    fn from(e: argon2::Error) -> Self {
-        Error::ProofOfWorkFailed(format!("{:?}", e))
-    }
-}
 
 impl From<aead::Error> for Error {
     fn from(_: aead::Error) -> Self {
@@ -93,12 +90,14 @@ pub trait NewSlowAead<A> {
     /// * `password` - secret data supplied by user
     /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
     /// `password` end up with different `cipher_key`s.
+    /// * `policy` - a optional policy that will control behaviour if the work function completes too quickly.
+    /// If policy is None, then no action is taken.
     ///
     /// # Errors
     ///
     /// Will return an error if proof of work functions parameters are not valid.
     ///
-    fn slow_new(&self, password: &[u8], salt: &[u8]) -> Result<A, Error>;
+    fn slow_new(&self, password: &[u8], salt: &[u8], policy: Option<&WorkPolicy>) -> Result<A, Error>;
 }
 
 /// NewSlowAead is implemented for anything that implements a work function.
@@ -107,7 +106,8 @@ impl<W, A> NewSlowAead<A> for W
         W: WorkFunction,
         A: NewAead,
 {
-    fn slow_new(&self, password: &[u8], salt: &[u8]) -> Result<A, Error> {
+
+    fn slow_new(&self, password: &[u8], salt: &[u8], policy: Option<&WorkPolicy>) -> Result<A, Error> {
 
         let now = Instant::now();
         let key = self.make_cipher_key(password, salt)?;
@@ -185,6 +185,12 @@ pub struct Argon2WorkFunction {
     pub mem_cost: u32,
     pub time_cost: u32,
     pub lanes: u32,
+}
+
+impl From<argon2::Error> for Error {
+    fn from(e: argon2::Error) -> Self {
+        Error::ProofOfWorkFailed(format!("{:?}", e))
+    }
 }
 
 impl WorkFunction for Argon2WorkFunction {
@@ -519,6 +525,233 @@ impl Argon2WorkFunction {
     }
 }
 
+
+const DEFAULT_LOG_WARNING_TRIGGER_PERCENT: u32 = 75;
+const DEFAULT_RETURN_ERROR_TRIGGER_PERCENT: u32 = 30;
+
+pub struct WorkPolicyBuilder {
+    log_warning_enabled: Option<bool>,
+    log_warning_trigger_percent: Option<u32>,
+    return_error_enabled: Option<bool>,
+    return_error_trigger_percent: Option<u32>,
+}
+
+impl Default for WorkPolicyBuilder {
+    fn default() -> Self {
+        WorkPolicyBuilder::new()
+    }
+}
+
+/// WorkPolicyBuilder allows users to configure a [WorkPolicy] with sensible defaulting.
+///
+/// ```
+/// # use slowlock::Error;
+/// # fn main() -> Result<(), Error> {
+///
+/// use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator, NewSlowAead};
+/// use std::time::Duration;
+/// use aes_gcm::Aes256Gcm;
+///
+/// let target_duration = Duration::from_millis(2500);
+///
+/// // Create a policy with a target duration of 2.5s that will:
+/// //  * log a warning if the proof of work function takes less than 75% of the target duration
+/// //  * return an error if the proof of work function takes less than 30% of target duration.
+/// let policy = WorkPolicyBuilder::default()
+///                 .build(target_duration);
+///
+/// // Try to create a lock that uses approximately 7.3% of total memory and takes
+/// // about 2.5s to process
+/// let work_fn = Argon2WorkFunctionCalibrator::default()
+///                 .memory_hint_percent(7.3)
+///                 .calibrate(target_duration)?;
+///
+/// // Attempt to create the cipher algorithm using the work function and checking the
+/// // policy.
+/// let algo: Aes256Gcm = work_fn.slow_new(b"password", &[0u8; 32], Some(&policy))?;
+///
+/// # Ok(()) }
+/// ```
+impl WorkPolicyBuilder {
+    /// Create a new calibrator with default parameters.
+    pub fn new() -> WorkPolicyBuilder {
+        WorkPolicyBuilder {
+            log_warning_enabled: None,
+            log_warning_trigger_percent: None,
+            return_error_enabled: None,
+            return_error_trigger_percent: None,
+        }
+    }
+
+
+    /// Control whether work function will return an error response if it completes too quickly.
+    ///
+    /// # Arguments
+    /// * `enabled` - if set to false the policy will never return an error. if set to true
+    /// the policy will return an error if the proof of work function completes too quickly.
+    ///
+    /// ```
+    /// # use slowlock::Error;
+    /// # fn main() -> Result<(), Error> {
+    ///
+    /// use slowlock::WorkPolicyBuilder;
+    /// use std::time::Duration;
+    ///
+    /// // Create a policy with a target duration of 2.5s that will never return an error.
+    /// let policy = WorkPolicyBuilder::default()
+    ///                 .return_error(false)
+    ///                 .build(Duration::from_millis(2500));
+    ///
+    /// # Ok(()) }
+    /// ```
+    pub fn return_error(mut self, enabled: bool) -> WorkPolicyBuilder {
+        self.return_error_enabled = Some(enabled);
+        self
+    }
+
+    /// Control how quickly the proof of work must complete to return an error.
+    ///
+    /// # Arguments
+    /// * `percent` - percentage of target duration below which a error will be returned
+    ///
+    /// ```
+    /// # use slowlock::Error;
+    /// # fn main() -> Result<(), Error> {
+    ///
+    /// use slowlock::WorkPolicyBuilder;
+    /// use std::time::Duration;
+    ///
+    /// // Create a policy with a target duration of 2.5s that will return an error
+    /// // if the proof of work function takes less than 35% of the target duration.
+    /// let policy = WorkPolicyBuilder::default()
+    ///                 .return_error_threshold(35)
+    ///                 .build(Duration::from_millis(2500));
+    ///
+    /// # Ok(()) }
+    /// ```
+    pub fn return_error_threshold(mut self, percent: u32) -> WorkPolicyBuilder {
+        self.return_error_trigger_percent = Some(percent);
+        self
+    }
+
+
+    /// Control whether work function will return an log a warning if it completes too quickly.
+    ///
+    /// Only availble if the `logging` feature is selected.
+    ///
+    /// # Arguments
+    /// * `enabled` - if set to false the policy will never return an error. if set to true
+    /// the policy will return an error if the proof of work function completes too quickly.
+    ///
+    /// ```
+    /// # use slowlock::Error;
+    /// # fn main() -> Result<(), Error> {
+    ///
+    /// use slowlock::WorkPolicyBuilder;
+    /// use std::time::Duration;
+    ///
+    /// // Create a policy with a target duration of 2.5s that will never return an error.
+    /// let policy = WorkPolicyBuilder::default()
+    ///                 .log_warning(false)
+    ///                 .build(Duration::from_millis(2500));
+    ///
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "logging")]
+    pub fn log_warning(mut self, enabled: bool) -> WorkPolicyBuilder {
+        self.log_warning_enabled = Some(enabled);
+        self
+    }
+
+
+    /// Control how quickly the proof of work must complete to log a warning.
+    ///
+    /// Only availble if the `logging` feature is selected.
+    ///
+    /// # Arguments
+    /// * `percent` - percentage of target duration below which a warning will be logged.
+    ///
+    /// ```
+    /// # use slowlock::Error;
+    /// # fn main() -> Result<(), Error> {
+    ///
+    /// use slowlock::WorkPolicyBuilder;
+    /// use std::time::Duration;
+    ///
+    /// // Create a policy with a target duration of 2.5s that will log a warning
+    /// // if the proof of work function takes less than 82% of the target duration.
+    /// let policy = WorkPolicyBuilder::default()
+    ///                 .log_warning_threshold(82)
+    ///                 .build(Duration::from_millis(2500));
+    ///
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "logging")]
+    pub fn log_warning_threshold(mut self, percent: u32) -> WorkPolicyBuilder {
+        self.log_warning_trigger_percent = Some(percent);
+        self
+    }
+
+
+    fn make_log_warning_trigger(&self) -> Option<u32> {
+        if cfg!(feature = "logging") && self.log_warning_enabled.unwrap_or(true) {
+            let trigger = self.log_warning_trigger_percent
+                .unwrap_or(DEFAULT_LOG_WARNING_TRIGGER_PERCENT);
+            Some(trigger)
+        } else {
+            None
+        }
+    }
+
+    fn make_return_error_trigger(&self) -> Option<u32> {
+        if self.return_error_enabled.unwrap_or(true) {
+            let trigger = self.return_error_trigger_percent
+                .unwrap_or(DEFAULT_RETURN_ERROR_TRIGGER_PERCENT);
+            Some(trigger)
+        } else {
+            None
+        }
+    }
+
+    pub fn build(self, target_duration: Duration) -> WorkPolicy {
+        let return_error_trigger = self.make_return_error_trigger();
+        let log_warning_trigger = self.make_log_warning_trigger();
+
+        WorkPolicy {
+            target_duration_ms: target_duration.as_millis() as u32,
+            log_warning_trigger,
+            return_error_trigger,
+        }
+    }
+}
+
+/// Policy controls how the create responds when the work function
+/// completes too quickly.
+///
+///
+/// ```
+/// # use slowlock::Error;
+/// # fn main() -> Result<(), Error> {
+///
+/// use slowlock::WorkPolicyBuilder;
+/// use std::time::Duration;
+///
+/// // Create a policy with a target duration of 2.5s that will:
+/// //  * log a warning if the proof of work function takes less than 75% of the target duration
+/// //  * return an error if the proof of work function takes less than 30% of target duration.
+/// let policy = WorkPolicyBuilder::default()
+///                 .build(Duration::from_millis(2500));
+///
+///
+/// # Ok(()) }
+/// ```
+pub struct WorkPolicy {
+    target_duration_ms: u32,
+    log_warning_trigger: Option<u32>,
+    return_error_trigger: Option<u32>,
+}
+
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -545,13 +778,13 @@ mod test {
 
     #[test]
     fn round_trip_aes_gcm128() {
-        let algo: Aes128Gcm = test_work_function().slow_new(b"password1", &[0u8; 32]).unwrap();
+        let algo: Aes128Gcm = test_work_function().slow_new(b"password1", &[0u8; 32], None).unwrap();
         round_trip_aead(algo);
     }
 
     #[test]
     fn round_trip_aes_gcm256() {
-        let algo: Aes256Gcm = test_work_function().slow_new(b"password1", &[0u8; 32]).unwrap();
+        let algo: Aes256Gcm = test_work_function().slow_new(b"password1", &[0u8; 32], None).unwrap();
         round_trip_aead(algo);
     }
 
@@ -661,7 +894,7 @@ mod test {
     fn algo_gen_fails_if_mem_cost_too_low() {
         let mut work_fn2 = test_work_function();
         work_fn2.mem_cost = 0;
-        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1);
+        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1, None);
         let err = result.err().unwrap();
 
         assert_eq!(Error::ProofOfWorkFailed("MemoryTooLittle".to_string()), err);
@@ -671,7 +904,7 @@ mod test {
     fn algo_gen_fails_if_time_cost_too_low() {
         let mut work_fn2 = test_work_function();
         work_fn2.time_cost = 0;
-        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1);
+        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1, None);
         let err = result.err().unwrap();
 
         assert_eq!(Error::ProofOfWorkFailed("TimeTooSmall".to_string()), err);
@@ -681,7 +914,7 @@ mod test {
     fn algo_gen_fails_if_lanes_too_low() {
         let mut work_fn2 = test_work_function();
         work_fn2.lanes = 0;
-        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1);
+        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1, None);
         let err = result.err().unwrap();
 
         assert_eq!(Error::ProofOfWorkFailed("LanesTooFew".to_string()), err);
@@ -691,7 +924,7 @@ mod test {
     fn algo_gen_fails_if_salt_too_short() {
         let work_fn2 = test_work_function();
         let short_salt = &[0u8; 7];
-        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, short_salt);
+        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, short_salt, None);
         let err = result.err().unwrap();
 
         assert_eq!(Error::ProofOfWorkFailed("SaltTooShort".to_string()), err);
@@ -706,8 +939,8 @@ mod test {
         salt1: &[u8],
         salt2: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        let algo1: Aes256Gcm = work_fn1.slow_new(&password1, salt1)?;
-        let algo2: Aes256Gcm = work_fn2.slow_new(&password2, salt2)?;
+        let algo1: Aes256Gcm = work_fn1.slow_new(&password1, salt1, None)?;
+        let algo2: Aes256Gcm = work_fn2.slow_new(&password2, salt2, None)?;
 
         let encrypted = algo1
             .encrypt(GenericArray::from_slice(&[0u8; 12]), &data[..])

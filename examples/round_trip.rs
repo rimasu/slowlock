@@ -8,6 +8,8 @@ use slowlock::{
     Argon2WorkFunctionCalibrator, Error, NewSlowAead,
 };
 
+
+
 fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
     println!(
         "# Round trip with work function target_duration={:?}",
@@ -36,7 +38,7 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
         target_duration
     );
     let encrypt_timer = Instant::now();
-    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt)?;
+    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt, None)?;
     let encrypted_message = algo.encrypt(&nonce, message)?;
     println!(
         "Encryption complete (actual time={:?})",
@@ -50,7 +52,7 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
         target_duration
     );
     let decrypt_timer = Instant::now();
-    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt)?;
+    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt, None)?;
     let decrypted_message = algo.decrypt(&nonce, encrypted_message.as_slice())?;
     println!(
         "Decryption complete (actual time={:?})",
