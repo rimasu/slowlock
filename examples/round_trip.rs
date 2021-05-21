@@ -1,14 +1,10 @@
 use std::time::{Duration, Instant};
 
 use aead::generic_array::GenericArray;
+use aead::Aead;
 use aes_gcm::Aes256Gcm;
 
-use aead::Aead;
-use slowlock::{
-    Argon2WorkFunctionCalibrator, Error, NewSlowAead,
-};
-
-
+use slowlock::{Argon2WorkFunctionCalibrator, Error, NewSlowAead, WorkPolicyBuilder};
 
 fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
     println!(
@@ -21,6 +17,8 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
     let work = Argon2WorkFunctionCalibrator::new()
         .verbose(true)
         .calibrate(target_duration)?;
+
+    let policy = WorkPolicyBuilder::new().build(target_duration);
 
     println!("Calibration complete");
 
@@ -38,7 +36,7 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
         target_duration
     );
     let encrypt_timer = Instant::now();
-    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt, None)?;
+    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt, &policy)?;
     let encrypted_message = algo.encrypt(&nonce, message)?;
     println!(
         "Encryption complete (actual time={:?})",
@@ -52,7 +50,7 @@ fn encryption_round_trip_demo(target_duration: Duration) -> Result<(), Error> {
         target_duration
     );
     let decrypt_timer = Instant::now();
-    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt, None)?;
+    let algo: Aes256Gcm = work.slow_new(password.as_bytes(), salt, &policy)?;
     let decrypted_message = algo.decrypt(&nonce, encrypted_message.as_slice())?;
     println!(
         "Decryption complete (actual time={:?})",

@@ -50,8 +50,8 @@
 //!
 use std::time::{Duration, Instant};
 
-use aead::generic_array::{ArrayLength, GenericArray};
 use aead::generic_array::typenum::consts::U32;
+use aead::generic_array::{ArrayLength, GenericArray};
 use aead::NewAead;
 #[cfg(feature = "logging")]
 use log::{info, warn};
@@ -77,9 +77,8 @@ pub enum Error {
     ProofOfWorkCompletedTooQuickly {
         target_duration_ms: u32,
         actual_duration_ms: u32,
-    }
+    },
 }
-
 
 impl From<aead::Error> for Error {
     fn from(_: aead::Error) -> Self {
@@ -93,31 +92,27 @@ pub trait NewSlowAead<A> {
     /// * `password` - secret data supplied by user
     /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
     /// `password` end up with different `cipher_key`s.
-    /// * `policy` - a optional policy that will control behaviour if the work function completes too quickly.
-    /// If policy is None, then no action is taken.
+    /// * `policy` - a policy that will control behaviour if the work function completes too quickly.
     ///
     /// # Errors
     ///
     /// Will return an error if proof of work functions parameters are not valid.
     ///
-    fn slow_new(&self, password: &[u8], salt: &[u8], policy: Option<&WorkPolicy>) -> Result<A, Error>;
+    fn slow_new(&self, password: &[u8], salt: &[u8], policy: &WorkPolicy) -> Result<A, Error>;
 }
 
 /// NewSlowAead is implemented for anything that implements a work function.
 impl<W, A> NewSlowAead<A> for W
-    where
-        W: WorkFunction,
-        A: NewAead,
+where
+    W: WorkFunction,
+    A: NewAead,
 {
-
-    fn slow_new(&self, password: &[u8], salt: &[u8], policy: Option<&WorkPolicy>) -> Result<A, Error> {
+    fn slow_new(&self, password: &[u8], salt: &[u8], policy: &WorkPolicy) -> Result<A, Error> {
         let now = Instant::now();
         let key = self.make_cipher_key(password, salt)?;
         let actual_duration_ms = now.elapsed().as_millis() as u32;
 
-        if let Some(policy) = policy {
-            policy.check_duration(actual_duration_ms)?;
-        }
+        policy.check_duration(actual_duration_ms)?;
 
         Ok(A::new(&key))
     }
@@ -136,9 +131,13 @@ pub trait WorkFunction: Sized {
     /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
     /// `password` end up with different `cipher_key`s.
     ///
-    fn make_cipher_key<K>(&self, password: &[u8], salt: &[u8]) -> Result<GenericArray<u8, K>, Error>
-        where
-            K: ArrayLength<u8>;
+    fn make_cipher_key<K>(
+        &self,
+        password: &[u8],
+        salt: &[u8],
+    ) -> Result<GenericArray<u8, K>, Error>
+    where
+        K: ArrayLength<u8>;
 }
 
 /// Work function based on Argon2.
@@ -201,8 +200,8 @@ impl From<argon2::Error> for Error {
 
 impl WorkFunction for Argon2WorkFunction {
     fn make_cipher_key<K>(&self, password: &[u8], salt: &[u8]) -> Result<GenericArray<u8, K>, Error>
-        where
-            K: ArrayLength<u8>,
+    where
+        K: ArrayLength<u8>,
     {
         let config = argon2::Config {
             ad: &[],
@@ -492,7 +491,6 @@ impl Argon2WorkFunctionCalibrator {
             let scale = target_duration.as_micros() as f64 / duration.as_micros() as f64;
             let next_mem_cost = (work.mem_cost as f64 * scale) as u32;
 
-
             if duration < lo {
                 #[cfg(feature = "logging")]
                 if self.verbose {
@@ -512,7 +510,7 @@ impl Argon2WorkFunctionCalibrator {
                         warn!("Although too high, using mem_cost as next adjustment will take it below lowest limit.\
                          This likely means that you have far too little memory allocated to Argon2")
                     }
-                    break
+                    break;
                 }
             }
             work.mem_cost = next_mem_cost;
@@ -530,7 +528,6 @@ impl Argon2WorkFunction {
         Ok(now.elapsed())
     }
 }
-
 
 const DEFAULT_LOG_WARNING_TRIGGER_PERCENT: u32 = 75;
 const DEFAULT_RETURN_ERROR_TRIGGER_PERCENT: u32 = 30;
@@ -573,7 +570,7 @@ impl Default for WorkPolicyBuilder {
 ///
 /// // Attempt to create the cipher algorithm using the work function and checking the
 /// // policy.
-/// let algo: Aes256Gcm = work_fn.slow_new(b"password", &[0u8; 32], Some(&policy))?;
+/// let algo: Aes256Gcm = work_fn.slow_new(b"password", &[0u8; 32], &policy)?;
 /// # Ok(()) }
 /// ```
 impl WorkPolicyBuilder {
@@ -586,7 +583,6 @@ impl WorkPolicyBuilder {
             return_error_trigger_percent: None,
         }
     }
-
 
     /// Control whether work function will return an error response if it completes too quickly.
     ///
@@ -638,10 +634,9 @@ impl WorkPolicyBuilder {
         self
     }
 
-
     /// Control whether work function will return an log a warning if it completes too quickly.
     ///
-    /// Only availble if the `logging` feature is selected.
+    /// Only has any effect if the `logging` feature is selected.
     ///
     /// # Arguments
     /// * `enabled` - if set to false the policy will never return an error. if set to true
@@ -661,16 +656,14 @@ impl WorkPolicyBuilder {
     ///
     /// # Ok(()) }
     /// ```
-    #[cfg(feature = "logging")]
     pub fn log_warning(mut self, enabled: bool) -> WorkPolicyBuilder {
         self.log_warning_enabled = Some(enabled);
         self
     }
 
-
     /// Control how quickly the proof of work must complete to log a warning.
     ///
-    /// Only availble if the `logging` feature is selected.
+    /// Only has any effect if the `logging` feature is selected.
     ///
     /// # Arguments
     /// * `percent` - percentage of target duration below which a warning will be logged.
@@ -690,16 +683,15 @@ impl WorkPolicyBuilder {
     ///
     /// # Ok(()) }
     /// ```
-    #[cfg(feature = "logging")]
     pub fn log_warning_threshold(mut self, percent: u32) -> WorkPolicyBuilder {
         self.log_warning_trigger_percent = Some(percent);
         self
     }
 
-
     fn make_log_warning_trigger(&self) -> Option<u32> {
         if cfg!(feature = "logging") && self.log_warning_enabled.unwrap_or(true) {
-            let trigger = self.log_warning_trigger_percent
+            let trigger = self
+                .log_warning_trigger_percent
                 .unwrap_or(DEFAULT_LOG_WARNING_TRIGGER_PERCENT);
             Some(trigger)
         } else {
@@ -709,7 +701,8 @@ impl WorkPolicyBuilder {
 
     fn make_return_error_trigger(&self) -> Option<u32> {
         if self.return_error_enabled.unwrap_or(true) {
-            let trigger = self.return_error_trigger_percent
+            let trigger = self
+                .return_error_trigger_percent
                 .unwrap_or(DEFAULT_RETURN_ERROR_TRIGGER_PERCENT);
             Some(trigger)
         } else {
@@ -776,7 +769,7 @@ impl WorkPolicy {
                 return Err(Error::ProofOfWorkCompletedTooQuickly {
                     target_duration_ms: self.target_duration_ms,
                     actual_duration_ms,
-                })
+                });
             }
         }
 
@@ -784,16 +777,18 @@ impl WorkPolicy {
     }
 }
 
-
 #[cfg(test)]
 mod test {
     use std::time::Duration;
 
-    use aead::Aead;
     use aead::generic_array::GenericArray;
+    use aead::Aead;
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
 
-    use crate::{Argon2WorkFunction, Argon2WorkFunctionCalibrator, Error, NewSlowAead, WorkPolicyBuilder};
+    use crate::{
+        Argon2WorkFunction, Argon2WorkFunctionCalibrator, Error, NewSlowAead, WorkPolicy,
+        WorkPolicyBuilder,
+    };
 
     const DATA: &[u8] = b"Secret data";
     const PASSWORD1: &[u8] = b"password1";
@@ -809,21 +804,32 @@ mod test {
         }
     }
 
+    fn do_nothing_policy() -> WorkPolicy {
+        WorkPolicyBuilder::new()
+            .log_warning(false)
+            .return_error(false)
+            .build(Duration::from_millis(2500))
+    }
+
     #[test]
     fn round_trip_aes_gcm128() {
-        let algo: Aes128Gcm = test_work_function().slow_new(b"password1", &[0u8; 32], None).unwrap();
+        let algo: Aes128Gcm = test_work_function()
+            .slow_new(b"password1", &[0u8; 32], &do_nothing_policy())
+            .unwrap();
         round_trip_aead(algo);
     }
 
     #[test]
     fn round_trip_aes_gcm256() {
-        let algo: Aes256Gcm = test_work_function().slow_new(b"password1", &[0u8; 32], None).unwrap();
+        let algo: Aes256Gcm = test_work_function()
+            .slow_new(b"password1", &[0u8; 32], &do_nothing_policy())
+            .unwrap();
         round_trip_aead(algo);
     }
 
     fn round_trip_aead<A>(algo: A)
-        where
-            A: Aead,
+    where
+        A: Aead,
     {
         let data = "message text".as_bytes();
         let nonce = &[0u8; 12];
@@ -841,39 +847,50 @@ mod test {
 
     #[test]
     fn decrypt_succeeds_if_work_fns_same() {
-        let out = round_trip(DATA,
-                             test_work_function(),
-                             test_work_function(),
-                             PASSWORD1,
-                             PASSWORD1,
-                             SALT1,
-                             SALT1).unwrap();
+        let out = round_trip(
+            DATA,
+            test_work_function(),
+            test_work_function(),
+            PASSWORD1,
+            PASSWORD1,
+            SALT1,
+            SALT1,
+        )
+        .unwrap();
 
         assert_eq!(DATA, out.as_slice());
     }
 
     #[test]
     fn decrypt_fails_if_password_is_wrong() {
-        let err = round_trip(DATA,
-                             test_work_function(),
-                             test_work_function(),
-                             PASSWORD1,
-                             PASSWORD2,
-                             SALT1,
-                             SALT1).err().unwrap();
+        let err = round_trip(
+            DATA,
+            test_work_function(),
+            test_work_function(),
+            PASSWORD1,
+            PASSWORD2,
+            SALT1,
+            SALT1,
+        )
+        .err()
+        .unwrap();
 
         assert_eq!(Error::AeadOperationFailed, err);
     }
 
     #[test]
     fn decrypt_fails_if_salt_is_wrong() {
-        let err = round_trip(DATA,
-                             test_work_function(),
-                             test_work_function(),
-                             PASSWORD1,
-                             PASSWORD1,
-                             SALT1,
-                             SALT2).err().unwrap();
+        let err = round_trip(
+            DATA,
+            test_work_function(),
+            test_work_function(),
+            PASSWORD1,
+            PASSWORD1,
+            SALT1,
+            SALT2,
+        )
+        .err()
+        .unwrap();
 
         assert_eq!(Error::AeadOperationFailed, err);
     }
@@ -882,13 +899,17 @@ mod test {
     fn decrypt_fails_if_mem_cost_is_wrong() {
         let mut work_fn2 = test_work_function();
         work_fn2.mem_cost += 1;
-        let err = round_trip(DATA,
-                             test_work_function(),
-                             work_fn2,
-                             PASSWORD1,
-                             PASSWORD1,
-                             SALT1,
-                             SALT1).err().unwrap();
+        let err = round_trip(
+            DATA,
+            test_work_function(),
+            work_fn2,
+            PASSWORD1,
+            PASSWORD1,
+            SALT1,
+            SALT1,
+        )
+        .err()
+        .unwrap();
 
         assert_eq!(Error::AeadOperationFailed, err);
     }
@@ -897,13 +918,17 @@ mod test {
     fn decrypt_fails_if_time_cost_is_wrong() {
         let mut work_fn2 = test_work_function();
         work_fn2.time_cost += 1;
-        let err = round_trip(DATA,
-                             test_work_function(),
-                             work_fn2,
-                             PASSWORD1,
-                             PASSWORD1,
-                             SALT1,
-                             SALT1).err().unwrap();
+        let err = round_trip(
+            DATA,
+            test_work_function(),
+            work_fn2,
+            PASSWORD1,
+            PASSWORD1,
+            SALT1,
+            SALT1,
+        )
+        .err()
+        .unwrap();
 
         assert_eq!(Error::AeadOperationFailed, err);
     }
@@ -912,13 +937,17 @@ mod test {
     fn decrypt_fails_if_lanes_is_wrong() {
         let mut work_fn2 = test_work_function();
         work_fn2.lanes += 1;
-        let err = round_trip(DATA,
-                             test_work_function(),
-                             work_fn2,
-                             PASSWORD1,
-                             PASSWORD1,
-                             SALT1,
-                             SALT1).err().unwrap();
+        let err = round_trip(
+            DATA,
+            test_work_function(),
+            work_fn2,
+            PASSWORD1,
+            PASSWORD1,
+            SALT1,
+            SALT1,
+        )
+        .err()
+        .unwrap();
 
         assert_eq!(Error::AeadOperationFailed, err);
     }
@@ -927,7 +956,8 @@ mod test {
     fn algo_gen_fails_if_mem_cost_too_low() {
         let mut work_fn2 = test_work_function();
         work_fn2.mem_cost = 0;
-        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1, None);
+        let result: Result<Aes256Gcm, Error> =
+            work_fn2.slow_new(PASSWORD1, SALT1, &do_nothing_policy());
         let err = result.err().unwrap();
 
         assert_eq!(Error::ProofOfWorkFailed("MemoryTooLittle".to_string()), err);
@@ -937,7 +967,8 @@ mod test {
     fn algo_gen_fails_if_time_cost_too_low() {
         let mut work_fn2 = test_work_function();
         work_fn2.time_cost = 0;
-        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1, None);
+        let result: Result<Aes256Gcm, Error> =
+            work_fn2.slow_new(PASSWORD1, SALT1, &do_nothing_policy());
         let err = result.err().unwrap();
 
         assert_eq!(Error::ProofOfWorkFailed("TimeTooSmall".to_string()), err);
@@ -947,7 +978,8 @@ mod test {
     fn algo_gen_fails_if_lanes_too_low() {
         let mut work_fn2 = test_work_function();
         work_fn2.lanes = 0;
-        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, SALT1, None);
+        let result: Result<Aes256Gcm, Error> =
+            work_fn2.slow_new(PASSWORD1, SALT1, &do_nothing_policy());
         let err = result.err().unwrap();
 
         assert_eq!(Error::ProofOfWorkFailed("LanesTooFew".to_string()), err);
@@ -957,7 +989,8 @@ mod test {
     fn algo_gen_fails_if_salt_too_short() {
         let work_fn2 = test_work_function();
         let short_salt = &[0u8; 7];
-        let result: Result<Aes256Gcm, Error> = work_fn2.slow_new(PASSWORD1, short_salt, None);
+        let result: Result<Aes256Gcm, Error> =
+            work_fn2.slow_new(PASSWORD1, short_salt, &do_nothing_policy());
         let err = result.err().unwrap();
 
         assert_eq!(Error::ProofOfWorkFailed("SaltTooShort".to_string()), err);
@@ -972,17 +1005,17 @@ mod test {
         salt1: &[u8],
         salt2: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        let algo1: Aes256Gcm = work_fn1.slow_new(&password1, salt1, None)?;
-        let algo2: Aes256Gcm = work_fn2.slow_new(&password2, salt2, None)?;
+        let algo1: Aes256Gcm = work_fn1.slow_new(&password1, salt1, &do_nothing_policy())?;
+        let algo2: Aes256Gcm = work_fn2.slow_new(&password2, salt2, &do_nothing_policy())?;
 
         let encrypted = algo1
             .encrypt(GenericArray::from_slice(&[0u8; 12]), &data[..])
             .unwrap();
 
-        algo2.decrypt(GenericArray::from_slice(&[0u8; 12]), encrypted.as_slice())
+        algo2
+            .decrypt(GenericArray::from_slice(&[0u8; 12]), encrypted.as_slice())
             .map_err(|e| e.into())
     }
-
 
     #[test]
     fn can_calibrate_with_fixed_num_lanes() {
@@ -1032,23 +1065,19 @@ mod test {
         assert!(work2.mem_cost > work1.mem_cost)
     }
 
-
     #[test]
     fn can_calibrate_with_verbose_true() {
-        let calibrator = Argon2WorkFunctionCalibrator::default()
-            .verbose(true);
+        let calibrator = Argon2WorkFunctionCalibrator::default().verbose(true);
 
         assert_eq!(true, calibrator.verbose);
     }
 
     #[test]
     fn can_calibrate_with_verbose_false() {
-        let calibrator = Argon2WorkFunctionCalibrator::default()
-            .verbose(false);
+        let calibrator = Argon2WorkFunctionCalibrator::default().verbose(false);
 
         assert_eq!(false, calibrator.verbose);
     }
-
 
     #[test]
     fn work_policy_will_return_an_error_if_and_only_if_actual_duration_below_trigger() {
@@ -1057,10 +1086,13 @@ mod test {
             .return_error_threshold(40)
             .build(Duration::from_millis(1000));
 
-        assert_eq!(Some(Error::ProofOfWorkCompletedTooQuickly {
-            target_duration_ms: 1000,
-            actual_duration_ms: 399,
-        }), policy.check_duration(399).err());
+        assert_eq!(
+            Some(Error::ProofOfWorkCompletedTooQuickly {
+                target_duration_ms: 1000,
+                actual_duration_ms: 399,
+            }),
+            policy.check_duration(399).err()
+        );
 
         assert_eq!(Ok(()), policy.check_duration(401));
     }
