@@ -74,7 +74,10 @@ pub enum Error {
     /// If it takes less that the expected `minimum_duration` this error is returned
     /// to warn users.  This can happen when the `WorkFunction` was tuned in a low performance
     /// environment and is subsequently used in a higher performance environment.
-    ProofOfWorkCompletedTooQuickly,
+    ProofOfWorkCompletedTooQuickly {
+        target_duration_ms: u32,
+        actual_duration_ms: u32,
+    }
 }
 
 
@@ -108,10 +111,13 @@ impl<W, A> NewSlowAead<A> for W
 {
 
     fn slow_new(&self, password: &[u8], salt: &[u8], policy: Option<&WorkPolicy>) -> Result<A, Error> {
-
         let now = Instant::now();
         let key = self.make_cipher_key(password, salt)?;
-        let work_duration = now.elapsed();
+        let actual_duration_ms = now.elapsed().as_millis() as u32;
+
+        if let Some(policy) = policy {
+            policy.check_duration(actual_duration_ms)?;
+        }
 
         Ok(A::new(&key))
     }
@@ -547,7 +553,6 @@ impl Default for WorkPolicyBuilder {
 /// ```
 /// # use slowlock::Error;
 /// # fn main() -> Result<(), Error> {
-///
 /// use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator, NewSlowAead};
 /// use std::time::Duration;
 /// use aes_gcm::Aes256Gcm;
@@ -569,7 +574,6 @@ impl Default for WorkPolicyBuilder {
 /// // Attempt to create the cipher algorithm using the work function and checking the
 /// // policy.
 /// let algo: Aes256Gcm = work_fn.slow_new(b"password", &[0u8; 32], Some(&policy))?;
-///
 /// # Ok(()) }
 /// ```
 impl WorkPolicyBuilder {
@@ -751,6 +755,35 @@ pub struct WorkPolicy {
     return_error_trigger: Option<u32>,
 }
 
+impl WorkPolicy {
+    // Check an actual duration against the policy
+    fn check_duration(&self, actual_duration_ms: u32) -> Result<(), Error> {
+        let normalized_duration = (actual_duration_ms * 100) / self.target_duration_ms;
+
+        #[cfg(feature = "logging")]
+        if let Some(log_warning_trigger) = self.log_warning_trigger {
+            if normalized_duration < log_warning_trigger {
+                warn!("Possible security vulnerability; proof of work completed too quickly. Target {}ms, actual {}ms ",
+                      self.target_duration_ms,
+                      actual_duration_ms
+                )
+            }
+        }
+
+        if let Some(return_error_trigger) = self.return_error_trigger {
+            if normalized_duration < return_error_trigger {
+                println!("{} {}", return_error_trigger, normalized_duration);
+                return Err(Error::ProofOfWorkCompletedTooQuickly {
+                    target_duration_ms: self.target_duration_ms,
+                    actual_duration_ms,
+                })
+            }
+        }
+
+        Ok(())
+    }
+}
+
 
 #[cfg(test)]
 mod test {
@@ -760,7 +793,7 @@ mod test {
     use aead::generic_array::GenericArray;
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
 
-    use crate::{Argon2WorkFunction, Argon2WorkFunctionCalibrator, Error, NewSlowAead};
+    use crate::{Argon2WorkFunction, Argon2WorkFunctionCalibrator, Error, NewSlowAead, WorkPolicyBuilder};
 
     const DATA: &[u8] = b"Secret data";
     const PASSWORD1: &[u8] = b"password1";
@@ -1014,5 +1047,39 @@ mod test {
             .verbose(false);
 
         assert_eq!(false, calibrator.verbose);
+    }
+
+
+    #[test]
+    fn work_policy_will_return_an_error_if_and_only_if_actual_duration_below_trigger() {
+        let policy = WorkPolicyBuilder::new()
+            .return_error(true)
+            .return_error_threshold(40)
+            .build(Duration::from_millis(1000));
+
+        assert_eq!(Some(Error::ProofOfWorkCompletedTooQuickly {
+            target_duration_ms: 1000,
+            actual_duration_ms: 399,
+        }), policy.check_duration(399).err());
+
+        assert_eq!(Ok(()), policy.check_duration(401));
+    }
+
+    #[cfg(feature = "logging")]
+    #[test]
+    fn work_policy_will_log_a_warning_if_and_only_if_actual_duration_below_trigger() {
+        // have to check logs to see output
+        // todo() make test for logging.
+        let policy = WorkPolicyBuilder::new()
+            .log_warning(true)
+            .log_warning_threshold(40)
+            .return_error(false)
+            .build(Duration::from_millis(1000));
+
+        // this should log a warning
+        assert_eq!(Ok(()), policy.check_duration(399));
+
+        // this should not log a warning.
+        assert_eq!(Ok(()), policy.check_duration(401));
     }
 }
