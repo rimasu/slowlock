@@ -17,18 +17,26 @@
 //! 1. `password` is passed through proof of work function to create `cipher_key`.
 //! 3. `cipher_key` and `nonce` are used to decrypt/encrypt content.
 //!
-//! To be useful the proof of work function must take a reasonable amount of time/effort
-//! to complete. This crates provides a [Argon2WorkFunctionCalibrator] with (I hope) reasonable
-//! defaults that can be used to create work functions with variable target durations.
+//! To be useful, the proof of work function must take a reasonable amount of time/effort
+//! to complete. This crates provides a [Argon2WorkFunctionCalibrator] that can be used to
+//! create work functions with variable target durations.
 //!
-//! The other part of this is detecting when a previously reasonable work function is now
-//! completing too quickly. Unless occasionally re-calibrated, we should expect this to happen
-//! over time as machine performance improves.
+//! Machine performance improves year on year, so we need to occasionally recalibrate
+//! the work function to ensure it continues to present an adequate challenge.  This crate
+//! does not automatically change the work function.  Instead, it measures its duration
+//! and provides a mechanism to alert the calling code when the proof of work function
+//! completes too quickly. These are controlled by the [WorkPolicy]. There are currently
+//! two ways the work policy can alert the user if a proof of work function completes too
+//! quickly:
 //!
-//! This crate has X ways to to detect work functions that are too weak.
+//! 1) If the `log_warning` policy is enabled, a message is written to the logs
+//! 2) If the `return_error` policy is enabled, an error is returned
 //!
-//! 1) If logging is enabled and the work function completes in less than two thirds the expected
-//! time a warning is logged.
+//! Both `log_warning` and `return_error` are enabled by default. The exact trigger
+//! levels can be tuned as percentage of the target duration.
+//!
+//! Separately, if the proof of work function is calibrated in debug mode, a warning is
+//! generated as the parameters will be far to weak.
 //!
 //! ## Design Choices (for review)
 //!
@@ -47,7 +55,7 @@
 //! work function is explicitly designed with key-widening in mind this complexity
 //! has been avoided.
 //!
-//! If better separation of real value (feed-back welcome) an alternative approach would be:
+//! If better separation of is real value (feed-back welcome) an alternative approach would be:
 //!
 //! 1) Pass hash of `password` to proof of work function
 //! 2) Combine proof of work output with original `password` to make `cipher_key`.
@@ -56,7 +64,8 @@
 //! or the `cipher_key`.  To do this I would need some way of safely performing step 2.
 //! I assume that for a 256 bit cipher, combining the `password` and proof of work using `SHA-256`
 //! would be acceptable.  I don't currently see a nice way to make this work on range
-//! of cipher-key lengths.
+//! of cipher-key lengths. A review of <https://www.iana.org/assignments/aead-parameters/aead-parameters.xhtml>
+//! suggest that  128 and 256 are by far the most common key lengths.
 //!
 //! ### Secret Hygiene
 //!
@@ -68,14 +77,17 @@
 //! 2) Memory being released without being cleared.
 //! 3) Memory being written to persistent storage.
 //!
-//! This crate only handles the `password` as a reference `&[u8]`. As mentioned it is passed to
-//! the proof of work function. As the current proof of work function has been developed for
-//! password hashes I am assuming that it has taken reasonable precautions, but am not in a
+//! This crate only handles the `password` as a reference `&[u8]`. As mentioned, the `password` is
+//! passed to the proof of work function. As the current proof of work function has been developed for
+//! password hashing I am assuming that it has taken reasonable precautions, but am not in a
 //! position to guarantee this.
 //!
-//! The `cipher_key` is a little more problematic. The proof of work function returns
-//! the result wrapped as a SecretVec to ensure that the `cipher_key` is cleared before
-//! the memory is released.
+//! The `cipher_key` is both generated and consumed within this crate.
+//! To give it some protection, the proof of work function returns the result wrapped as a SecretVec
+//! to ensure that the `cipher_key` is cleared before the memory is released.
+//!
+//! Neither of these address the third problem, i.e., secrets being written to persistent
+//! storage.
 //!
 //! ### Fixed Argon2 "secret"
 //!
@@ -89,10 +101,69 @@
 //! directly used as the `cipher_key`). This means there is limited risk of the attacker gaining access
 //! to the `salt` and hashed password.
 //!
+//! ## Basic Usage
+//! ```
+//! # use slowlock::Error;
+//! # fn main() -> Result<(), Error> {
+//! use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator, NewSlowAead};
+//! use std::time::Duration;
+//! use hex_literal::hex;
+//! use aes_gcm::Aes256Gcm;
+//! use aead::Aead;
+//! use aead::generic_array::GenericArray;
+//!
+//! let target_duration = Duration::from_millis(2500);
+//!
+//! // Create a policy with a target duration of 2.5s that will:
+//! //  * log a warning if the proof of work function takes less than 75% of the target duration
+//! //  * return an error if the proof of work function takes less than 30% of target duration.
+//! let policy = WorkPolicyBuilder::default()
+//!                 .build(target_duration);
+//!
+//! // Try to create a lock that uses approximately 5% of total memory and takes
+//! // about 2.5s to process
+//! let work_fn = Argon2WorkFunctionCalibrator::default()
+//!           .calibrate(target_duration)?;
+//!
+//! // User supplied secret. This could be a password or a key recovered
+//! // from an earlier stage in the decryption/encryption process.
+//! let password = "super secret password".as_bytes();
+//!
+//! // Salt should be generated using a cryptographically secure pseudo-random number generator
+//! // It needs to be stored alongside the encrypted values
+//! let salt = hex!("8a248444f2fc50308a856b35de67b312a4c4be1d180f49e101bf6330af5d47");
+//!
+//! // Attempt to create the cipher algorithm using the work function and checking the
+//! // policy.
+//! // This process should take about 2.5 seconds.
+//! let algo: Aes256Gcm = work_fn.slow_new(&password, &salt, &policy)?;
+//!
+//!
+//! // Nonce _must_ be unique each time data is encrypted with the same cipher_key.
+//! // If the salt if changed the cipher_key is implicitly changed so the nonce
+//! // could be reset.
+//! let nonce = hex!("1d180f49e101bf6330af5d47");
+//!
+//! let plain_text = "secret content to protect".as_bytes();
+//!
+//! let cipher_text = algo.encrypt(
+//!      GenericArray::from_slice(&nonce),
+//!      plain_text
+//! )?;
+//!
+//! let recovered_plain_text = algo.decrypt(
+//!     GenericArray::from_slice(&nonce),
+//!     cipher_text.as_slice()
+//! )?;
+//!
+//! assert_eq!(plain_text, recovered_plain_text);
+//!
+//! # Ok(()) }
+//! ```
+//!
 use std::time::{Duration, Instant};
 
-use aead::generic_array::{ArrayLength, GenericArray};
-use aead::generic_array::typenum::consts::U32;
+use aead::generic_array::GenericArray;
 use aead::generic_array::typenum::Unsigned;
 use aead::NewAead;
 #[cfg(feature = "logging")]
@@ -258,7 +329,7 @@ impl WorkFunction for Argon2WorkFunction {
 
         argon2::hash_raw(password, salt, &config)
             .map_err(|e| e.into())
-            .map(|h| SecretVec::new(h))
+            .map(SecretVec::new)
     }
 }
 
@@ -422,6 +493,14 @@ impl Argon2WorkFunctionCalibrator {
     /// * `target_duration` - how long the work function should take to complete
     ///
     pub fn calibrate(self, target_duration: Duration) -> Result<Argon2WorkFunction, Error> {
+
+        #[cfg(debug_assertions)] {
+            #[cfg(logging)] {
+                warn!("Calibrating proof of work function in debug bug - the parameters generated will be too weak.")
+            }
+        }
+
+
         let mut work = self.initialize_base_line();
 
         let rough = self.calibrate_time_cost(target_duration, &mut work)?;
