@@ -41,6 +41,63 @@ levels can be tuned as percentage of the target duration.
 Separately, if the proof of work function is calibrated in debug mode, a warning is
 generated as the parameters will be far to weak.
 
+### Basic Usage
+```rust
+use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator, NewSlowAead};
+use std::time::Duration;
+use hex_literal::hex;
+use aes_gcm::Aes256Gcm;
+use aead::Aead;
+use aead::generic_array::GenericArray;
+
+let target_duration = Duration::from_millis(2500);
+
+// Create a policy with a target duration of 2.5s that will:
+//  * log a warning if the proof of work function takes less than 75% of the target duration
+//  * return an error if the proof of work function takes less than 30% of target duration.
+let policy = WorkPolicyBuilder::default()
+                .build(target_duration);
+
+// Try to create a lock that uses approximately 5% of total memory and takes
+// about 2.5s to process
+let work_fn = Argon2WorkFunctionCalibrator::default()
+          .calibrate(target_duration)?;
+
+// User supplied secret. This could be a password or a key recovered
+// from an earlier stage in the decryption/encryption process.
+let password = "super secret password".as_bytes();
+
+// Salt should be generated using a cryptographically secure pseudo-random number generator
+// It needs to be stored alongside the encrypted values
+let salt = hex!("8a248444f2fc50308a856b35de67b312a4c4be1d180f49e101bf6330af5d47");
+
+// Attempt to create the cipher algorithm using the work function and checking the
+// policy.
+// This process should take about 2.5 seconds.
+let algo: Aes256Gcm = work_fn.slow_new(&password, &salt, &policy)?;
+
+
+// Nonce _must_ be unique each time data is encrypted with the same cipher_key.
+// If the salt if changed the cipher_key is implicitly changed so the nonce
+// could be reset.
+let nonce = hex!("1d180f49e101bf6330af5d47");
+
+let plain_text = "secret content to protect".as_bytes();
+
+let cipher_text = algo.encrypt(
+     GenericArray::from_slice(&nonce),
+     plain_text
+)?;
+
+let recovered_plain_text = algo.decrypt(
+    GenericArray::from_slice(&nonce),
+    cipher_text.as_slice()
+)?;
+
+assert_eq!(plain_text, recovered_plain_text);
+
+```
+
 ### Design Choices (for review)
 
 This is a log of design choices I have made in this library. I am not a security
@@ -103,64 +160,6 @@ In this library Argon2 is not being used to verify password, but as a proof of w
 function. So although the salt is stored, the hashed password is never exposed (it is
 directly used as the `cipher_key`). This means there is limited risk of the attacker gaining access
 to the `salt` and hashed password.
-
-### Basic Usage
-```rust
-use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator, NewSlowAead};
-use std::time::Duration;
-use hex_literal::hex;
-use aes_gcm::Aes256Gcm;
-use aead::Aead;
-use aead::generic_array::GenericArray;
-
-let target_duration = Duration::from_millis(2500);
-
-// Create a policy with a target duration of 2.5s that will:
-//  * log a warning if the proof of work function takes less than 75% of the target duration
-//  * return an error if the proof of work function takes less than 30% of target duration.
-let policy = WorkPolicyBuilder::default()
-                .build(target_duration);
-
-// Try to create a lock that uses approximately 5% of total memory and takes
-// about 2.5s to process
-let work_fn = Argon2WorkFunctionCalibrator::default()
-          .calibrate(target_duration)?;
-
-// User supplied secret. This could be a password or a key recovered
-// from an earlier stage in the decryption/encryption process.
-let password = "super secret password".as_bytes();
-
-// Salt should be generated using a cryptographically secure pseudo-random number generator
-// It needs to be stored alongside the encrypted values
-let salt = hex!("8a248444f2fc50308a856b35de67b312a4c4be1d180f49e101bf6330af5d47");
-
-// Attempt to create the cipher algorithm using the work function and checking the
-// policy.
-// This process should take about 2.5 seconds.
-let algo: Aes256Gcm = work_fn.slow_new(&password, &salt, &policy)?;
-
-
-// Nonce _must_ be unique each time data is encrypted with the same cipher_key.
-// If the salt if changed the cipher_key is implicitly changed so the nonce
-// could be reset.
-let nonce = hex!("1d180f49e101bf6330af5d47");
-
-let plain_text = "secret content to protect".as_bytes();
-
-let cipher_text = algo.encrypt(
-     GenericArray::from_slice(&nonce),
-     plain_text
-)?;
-
-let recovered_plain_text = algo.decrypt(
-    GenericArray::from_slice(&nonce),
-    cipher_text.as_slice()
-)?;
-
-assert_eq!(plain_text, recovered_plain_text);
-
-```
-
 
 Current version: 0.1.0
 
