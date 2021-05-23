@@ -16,6 +16,7 @@ homepage = "https://github.com/rimasu/slowlock"
 aead = "0.4.1"
 rust-argon2 = "0.8.3"
 sysinfo = "0.17.3"
+secrecy = "0.7.0"
 log = { version = "0.4.14", optional = true }
 
 [features]

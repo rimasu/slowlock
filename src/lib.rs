@@ -36,6 +36,47 @@
 //! expert and these may be wrong - so I'm calling them out here so that users are
 //! pre-warned.  Any review gratefully received.
 //!
+//! ### Trustworthy Work Function
+//!
+//! Currently the `password` is passed to the proof of work function and the output of
+//! the proof of work function is used as the `cipher_key`.
+//!
+//! So as well as being a proof of work function, it is also performing any necessary
+//! key widening.  It would seem cleaner to separate these responsibilities. Decoupling
+//! would, of course, introduce its own complexity.  Given the current proof of
+//! work function is explicitly designed with key-widening in mind this complexity
+//! has been avoided.
+//!
+//! If better separation of real value (feed-back welcome) an alternative approach would be:
+//!
+//! 1) Pass hash of `password` to proof of work function
+//! 2) Combine proof of work output with original `password` to make `cipher_key`.
+//!
+//! This would prevent leakages in the proof of work function revealing either the `password`
+//! or the `cipher_key`.  To do this I would need some way of safely performing step 2.
+//! I assume that for a 256 bit cipher, combining the `password` and proof of work using `SHA-256`
+//! would be acceptable.  I don't currently see a nice way to make this work on range
+//! of cipher-key lengths.
+//!
+//! ### Secret Hygiene
+//!
+//! The crate handles two secrets, the original `password` and the `cipher_key`. If either of
+//! these leaked then the security of the cipher is compromised.  These are a ways I am aware they
+//! could leak:
+//!
+//! 1) Logging (easily avoided).
+//! 2) Memory being released without being cleared.
+//! 3) Memory being written to persistent storage.
+//!
+//! This crate only handles the `password` as a reference `&[u8]`. As mentioned it is passed to
+//! the proof of work function. As the current proof of work function has been developed for
+//! password hashes I am assuming that it has taken reasonable precautions, but am not in a
+//! position to guarantee this.
+//!
+//! The `cipher_key` is a little more problematic. The proof of work function returns
+//! the result wrapped as a SecretVec to ensure that the `cipher_key` is cleared before
+//! the memory is released.
+//!
 //! ### Fixed Argon2 "secret"
 //!
 //! Argon2 supports use of a secret.  This can be used a 'pepper'. Unlike a salt, a pepper is
@@ -50,12 +91,15 @@
 //!
 use std::time::{Duration, Instant};
 
-use aead::generic_array::typenum::consts::U32;
 use aead::generic_array::{ArrayLength, GenericArray};
+use aead::generic_array::typenum::consts::U32;
+use aead::generic_array::typenum::Unsigned;
 use aead::NewAead;
 #[cfg(feature = "logging")]
 use log::{info, warn};
+use secrecy::{ExposeSecret, SecretVec};
 use sysinfo::{System, SystemExt};
+
 
 /// Library error types
 #[derive(Debug, Eq, PartialEq)]
@@ -109,12 +153,10 @@ where
 {
     fn slow_new(&self, password: &[u8], salt: &[u8], policy: &WorkPolicy) -> Result<A, Error> {
         let now = Instant::now();
-        let key = self.make_cipher_key(password, salt)?;
+        let key = self.make_cipher_key(A::KeySize::to_u32(), password, salt)?;
         let actual_duration_ms = now.elapsed().as_millis() as u32;
-
         policy.check_duration(actual_duration_ms)?;
-
-        Ok(A::new(&key))
+        Ok(A::new(GenericArray::from_slice(key.expose_secret())))
     }
 }
 
@@ -127,17 +169,17 @@ pub trait WorkFunction: Sized {
     /// Generate a `cipher_key` from a `password` and a `salt`.
     ///
     /// # Arguments
+    /// * `work_size` - how big the proof of work should be
     /// * `password` - secret data supplied by user
     /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
     /// `password` end up with different `cipher_key`s.
     ///
-    fn make_cipher_key<K>(
+    fn make_cipher_key(
         &self,
+        work_size: u32,
         password: &[u8],
         salt: &[u8],
-    ) -> Result<GenericArray<u8, K>, Error>
-    where
-        K: ArrayLength<u8>;
+    ) -> Result<SecretVec<u8>, Error>;
 }
 
 /// Work function based on Argon2.
@@ -163,6 +205,7 @@ pub trait WorkFunction: Sized {
 /// use aead::generic_array::{GenericArray, typenum::U32};
 /// use hex_literal::hex;
 /// use slowlock::{Argon2WorkFunction, WorkFunction};
+/// use secrecy::ExposeSecret;
 ///
 /// // Normally you should use the `Argon2WorkFunctionCalibrator`, but to make sure we
 /// // get exactly the same configuration we are going to fix the parameters.
@@ -179,10 +222,10 @@ pub trait WorkFunction: Sized {
 /// // Salt should be generated using a cryptographically secure pseudo random number generator
 /// let salt = hex!("8a248444f2fc50308a856b35de67b312a4c4be1d180f49e101bf6330af5d47");
 ///
-/// let key: GenericArray<u8, U32> = work_fn.make_cipher_key(password, &salt)?;
+/// let key = work_fn.make_cipher_key(32, password, &salt)?;
 ///
 /// let expected_key = &hex!("a2867fb2a2ddb384cba4f382f5db48b36066cbcb755ed7f07aeabef1f98fbf54");
-/// assert_eq!(expected_key, key.as_slice());
+/// assert_eq!(expected_key, key.expose_secret().as_slice());
 ///
 /// # Ok(()) }
 /// ```
@@ -199,13 +242,11 @@ impl From<argon2::Error> for Error {
 }
 
 impl WorkFunction for Argon2WorkFunction {
-    fn make_cipher_key<K>(&self, password: &[u8], salt: &[u8]) -> Result<GenericArray<u8, K>, Error>
-    where
-        K: ArrayLength<u8>,
+    fn make_cipher_key(&self, work_size: u32, password: &[u8], salt: &[u8]) -> Result<SecretVec<u8>, Error>
     {
         let config = argon2::Config {
             ad: &[],
-            hash_length: K::to_u32(),
+            hash_length: work_size,
             lanes: self.lanes,
             mem_cost: self.mem_cost,
             secret: &[],
@@ -217,7 +258,7 @@ impl WorkFunction for Argon2WorkFunction {
 
         argon2::hash_raw(password, salt, &config)
             .map_err(|e| e.into())
-            .map(|h| GenericArray::clone_from_slice(&h))
+            .map(|h| SecretVec::new(h))
     }
 }
 
@@ -524,7 +565,7 @@ impl Argon2WorkFunctionCalibrator {
 impl Argon2WorkFunction {
     fn estimate_duration(&self) -> Result<Duration, Error> {
         let now = Instant::now();
-        let _key: GenericArray<u8, U32> = self.make_cipher_key(&[0u8; 32], &[0u8; 32])?;
+        self.make_cipher_key(32, &[0u8; 32], &[0u8; 32])?;
         Ok(now.elapsed())
     }
 }
@@ -781,8 +822,8 @@ impl WorkPolicy {
 mod test {
     use std::time::Duration;
 
-    use aead::generic_array::GenericArray;
     use aead::Aead;
+    use aead::generic_array::GenericArray;
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
 
     use crate::{

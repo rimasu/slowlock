@@ -39,6 +39,47 @@ This is a log of design choices I have made in this library. I am not a security
 expert and these may be wrong - so I'm calling them out here so that users are
 pre-warned.  Any review gratefully received.
 
+#### Trustworthy Work Function
+
+Currently the `password` is passed to the proof of work function and the output of
+the proof of work function is used as the `cipher_key`.
+
+So as well as being a proof of work function, it is also performing any necessary
+key widening.  It would seem cleaner to separate these responsibilities. Decoupling
+would, of course, introduce its own complexity.  Given the current proof of
+work function is explicitly designed with key-widening in mind this complexity
+has been avoided.
+
+If better separation of real value (feed-back welcome) an alternative approach would be:
+
+1) Pass hash of `password` to proof of work function
+2) Combine proof of work output with original `password` to make `cipher_key`.
+
+This would prevent leakages in the proof of work function revealing either the `password`
+or the `cipher_key`.  To do this I would need some way of safely performing step 2.
+I assume that for a 256 bit cipher, combining the `password` and proof of work using `SHA-256`
+would be acceptable.  I don't currently see a nice way to make this work on range
+of cipher-key lengths.
+
+#### Secret Hygiene
+
+The crate handles two secrets, the original `password` and the `cipher_key`. If either of
+these leaked then the security of the cipher is compromised.  These are a ways I am aware they
+could leak:
+
+1) Logging (easily avoided).
+2) Memory being released without being cleared.
+3) Memory being written to persistent storage.
+
+This crate only handles the `password` as a reference `&[u8]`. As mentioned it is passed to
+the proof of work function. As the current proof of work function has been developed for
+password hashes I am assuming that it has taken reasonable precautions, but am not in a
+position to guarantee this.
+
+The `cipher_key` is a little more problematic. The proof of work function returns
+the result wrapped as a SecretVec to ensure that the `cipher_key` is cleared before
+the memory is released.
+
 #### Fixed Argon2 "secret"
 
 Argon2 supports use of a secret.  This can be used a 'pepper'. Unlike a salt, a pepper is
