@@ -1,7 +1,7 @@
 //! # Slow Lock
 //!
 //! Slow is a thin convenience layer that makes it easy to use a proof of work function
-//! to recover a cipher key.
+//! to derive a cipher key.
 //!
 //! It implements no new cryptographic primitives, instead in provides some mechanisms to
 //!
@@ -97,6 +97,50 @@
 //!
 //! # Ok(()) }
 //! ```
+//! 
+//! ## Creating Key Directly
+//! 
+//! Rather than immediately turning the derived key into a cipher, the caller
+//! directly obtain the key.  This may be useful if the caller wants to cache
+//! the key for later reuse (to avoid having to derive it repeatedly).  Obviously,
+//! the caller must take as much care that the derived key is not leaked.
+//! 
+//! ```
+//! # use slowlock::Error;
+//! # fn main() -> Result<(), Error> {
+//! use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator};
+//! use std::time::Duration;
+//! use hex_literal::hex;;
+//!
+//! let target_duration = Duration::from_millis(2500);
+//!
+//! // Create a policy with a target duration of 2.5s that will:
+//! //  * log a warning if the proof of work function takes less than 75% of the target duration
+//! //  * return an error if the proof of work function takes less than 30% of target duration.
+//! let policy = WorkPolicyBuilder::default()
+//!                 .build(target_duration);
+//!
+//! // Try to create a lock that uses approximately 5% of total memory and takes
+//! // about 2.5s to process
+//! let work_fn = Argon2WorkFunctionCalibrator::default()
+//!           .calibrate(target_duration)?;
+//!
+//! // User supplied secret. This could be a password or a key derived
+//! // from an earlier stage in the decryption/encryption process.
+//! let password = "super secret password".as_bytes();
+//!
+//! // Salt should be generated using a cryptographically secure pseudo-random number generator
+//! // It needs to be stored alongside the encrypted values
+//! let salt = hex!("8a248444f2fc50308a856b35de67b312a4c4be1d180f49e101bf6330af5d47");
+//!
+//! // Attempt to derive the key.
+//! // This process should take about 2.5 seconds.
+//! let key = policy.make_cipher_key(32, &password, &salt, &work_fn)?;
+//! 
+//! // Can then use key to initialize cipher as many times as needed.
+//!
+//! # Ok(()) }
+//! ```
 //!
 //! ## Design Choices (for review)
 //!
@@ -162,14 +206,13 @@
 //! to the `salt` and hashed password.
 use std::time::{Duration, Instant};
 
-use aead::generic_array::GenericArray;
 use aead::generic_array::typenum::Unsigned;
+use aead::generic_array::GenericArray;
 use aead::NewAead;
 #[cfg(feature = "logging")]
 use log::{info, warn};
 use secrecy::{ExposeSecret, SecretVec};
 use sysinfo::{System, SystemExt};
-
 
 /// Library error types
 #[derive(Debug, Eq, PartialEq)]
@@ -222,10 +265,7 @@ where
     A: NewAead,
 {
     fn slow_new(&self, password: &[u8], salt: &[u8], policy: &WorkPolicy) -> Result<A, Error> {
-        let now = Instant::now();
-        let key = self.make_cipher_key(A::KeySize::to_u32(), password, salt)?;
-        let actual_duration_ms = now.elapsed().as_millis() as u32;
-        policy.check_duration(actual_duration_ms)?;
+        let key = policy.make_cipher_key(A::KeySize::to_u32(), password, salt, self)?;
         Ok(A::new(GenericArray::from_slice(key.expose_secret())))
     }
 }
@@ -312,8 +352,12 @@ impl From<argon2::Error> for Error {
 }
 
 impl WorkFunction for Argon2WorkFunction {
-    fn make_cipher_key(&self, work_size: u32, password: &[u8], salt: &[u8]) -> Result<SecretVec<u8>, Error>
-    {
+    fn make_cipher_key(
+        &self,
+        work_size: u32,
+        password: &[u8],
+        salt: &[u8],
+    ) -> Result<SecretVec<u8>, Error> {
         let config = argon2::Config {
             ad: &[],
             hash_length: work_size,
@@ -492,13 +536,13 @@ impl Argon2WorkFunctionCalibrator {
     /// * `target_duration` - how long the work function should take to complete
     ///
     pub fn calibrate(self, target_duration: Duration) -> Result<Argon2WorkFunction, Error> {
-
-        #[cfg(debug_assertions)] {
-            #[cfg(logging)] {
+        #[cfg(debug_assertions)]
+        {
+            #[cfg(logging)]
+            {
                 warn!("Calibrating proof of work function in debug bug - the parameters generated will be too weak.")
             }
         }
-
 
         let mut work = self.initialize_base_line();
 
@@ -868,6 +912,32 @@ pub struct WorkPolicy {
 }
 
 impl WorkPolicy {
+    /// Generate a `cipher_key` from a `password` and a `salt`.
+    ///
+    /// # Arguments
+    /// * `key_size` - how big the cipher key should be.
+    /// * `password` - secret data supplied by user
+    /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
+    /// `password` end up with different `cipher_key`s.
+    /// * `work_fn` - work function used to translate `password` into cipher key.
+    ///
+    pub fn make_cipher_key<W>(
+        &self,
+        key_size: u32,
+        password: &[u8],
+        salt: &[u8],
+        work_fn: &W,
+    ) -> Result<SecretVec<u8>, Error>
+    where
+        W: WorkFunction,
+    {
+        let now = Instant::now();
+        let key = work_fn.make_cipher_key(key_size, password, salt)?;
+        let actual_duration_ms = now.elapsed().as_millis() as u32;
+        self.check_duration(actual_duration_ms)?;
+        Ok(key)
+    }
+
     // Check an actual duration against the policy
     fn check_duration(&self, actual_duration_ms: u32) -> Result<(), Error> {
         let normalized_duration = (actual_duration_ms * 100) / self.target_duration_ms;
@@ -900,8 +970,8 @@ impl WorkPolicy {
 mod test {
     use std::time::Duration;
 
-    use aead::Aead;
     use aead::generic_array::GenericArray;
+    use aead::Aead;
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
 
     use crate::{
