@@ -920,7 +920,27 @@ impl WorkPolicy {
     /// * `salt` - pseudo-random data stored with secured data to ensure that users with same
     /// `password` end up with different `cipher_key`s.
     /// * `work_fn` - work function used to translate `password` into cipher key.
+    /// 
+    /// ```
+    /// # use slowlock::Error;
+    /// # fn main() -> Result<(), Error> {
+    /// use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator};
+    /// use std::time::Duration;
+    /// use hex_literal::hex;;
     ///
+    /// let target_duration = Duration::from_millis(2500);
+    ///
+    /// let policy = WorkPolicyBuilder::default()
+    ///                 .build(target_duration);
+    /// 
+    /// let work_fn = Argon2WorkFunctionCalibrator::default()
+    ///           .calibrate(target_duration)?;
+    ///
+    /// let password = "super secret password".as_bytes();
+    /// let salt = hex!("8a248444f2fc50308a856b35de67b312a4c4be1d180f49e101bf6330af5d47");
+    /// let key = policy.make_cipher_key(32, &password, &salt, &work_fn)?;
+    /// # Ok(()) }
+    /// ```
     pub fn make_cipher_key<W>(
         &self,
         key_size: u32,
