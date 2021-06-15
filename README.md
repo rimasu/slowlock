@@ -103,7 +103,7 @@ assert_eq!(plain_text, recovered_plain_text);
 Rather than immediately turning the derived key into a cipher, the caller
 directly obtain the key.  This may be useful if the caller wants to cache
 the key for later reuse (to avoid having to derive it repeatedly).  Obviously,
-the caller must take as much care that the derived key is not leaked.
+the caller must take care that the derived key is not leaked.
 
 ```rust
 use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator};

@@ -103,7 +103,7 @@
 //! Rather than immediately turning the derived key into a cipher, the caller
 //! directly obtain the key.  This may be useful if the caller wants to cache
 //! the key for later reuse (to avoid having to derive it repeatedly).  Obviously,
-//! the caller must take as much care that the derived key is not leaked.
+//! the caller must take care that the derived key is not leaked.
 //! 
 //! ```
 //! # use slowlock::Error;
