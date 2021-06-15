@@ -4,7 +4,7 @@
 ## Slow Lock
 
 Slow is a thin convenience layer that makes it easy to use a proof of work function
-to recover a cipher key.
+to derive a cipher key.
 
 It implements no new cryptographic primitives, instead in provides some mechanisms to
 
@@ -98,6 +98,47 @@ assert_eq!(plain_text, recovered_plain_text);
 
 ```
 
+### Creating Key Directly
+
+Rather than immediately turning the derived key into a cipher, the caller
+directly obtain the key.  This may be useful if the caller wants to cache
+the key for later reuse (to avoid having to derive it repeatedly).  Obviously,
+the caller must take as much care that the derived key is not leaked.
+
+```rust
+use slowlock::{WorkPolicyBuilder, Argon2WorkFunctionCalibrator};
+use std::time::Duration;
+use hex_literal::hex;;
+
+let target_duration = Duration::from_millis(2500);
+
+// Create a policy with a target duration of 2.5s that will:
+//  * log a warning if the proof of work function takes less than 75% of the target duration
+//  * return an error if the proof of work function takes less than 30% of target duration.
+let policy = WorkPolicyBuilder::default()
+                .build(target_duration);
+
+// Try to create a lock that uses approximately 5% of total memory and takes
+// about 2.5s to process
+let work_fn = Argon2WorkFunctionCalibrator::default()
+          .calibrate(target_duration)?;
+
+// User supplied secret. This could be a password or a key derived
+// from an earlier stage in the decryption/encryption process.
+let password = "super secret password".as_bytes();
+
+// Salt should be generated using a cryptographically secure pseudo-random number generator
+// It needs to be stored alongside the encrypted values
+let salt = hex!("8a248444f2fc50308a856b35de67b312a4c4be1d180f49e101bf6330af5d47");
+
+// Attempt to derive the key.
+// This process should take about 2.5 seconds.
+let key = policy.make_cipher_key(32, &password, &salt, &work_fn)?;
+
+// Can then use key to initialize cipher as many times as needed.
+
+```
+
 ### Design Choices (for review)
 
 This is a log of design choices I have made in this library. I am not a security
@@ -161,7 +202,7 @@ function. So although the salt is stored, the hashed password is never exposed (
 directly used as the `cipher_key`). This means there is limited risk of the attacker gaining access
 to the `salt` and hashed password.
 
-Current version: 0.1.0
+Current version: 0.2.0
 
 This is a hobby project; I don't have the bandwidth
 to properly maintain this.  You are welcome to use
