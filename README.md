@@ -101,7 +101,7 @@ assert_eq!(plain_text, recovered_plain_text);
 ### Creating Key Directly
 
 Rather than immediately turning the derived key into a cipher, the caller
-directly obtain the key.  This may be useful if the caller wants to cache
+can obtain the key directly.  This may be useful if the caller wants to cache
 the key for later reuse (to avoid having to derive it repeatedly).  Obviously,
 the caller must take care that the derived key is not leaked.
 
